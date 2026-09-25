@@ -1,0 +1,13 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+.env
+output/
+student_resource/dataset/
+student_resource/*.zip
+*.zip
+__MACOSX/
