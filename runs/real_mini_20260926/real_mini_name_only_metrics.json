@@ -1,0 +1,28 @@
+[
+  {
+    "retriever": "name_only_symbolic_soundex",
+    "queries": 40,
+    "truth_pairs": 106,
+    "blocking_recall": 0.9622641509433962,
+    "recall_at_200": 0.9622641509433962,
+    "mean_candidates": 166.05,
+    "p95_candidates": 270.25,
+    "tfidf_fallback_queries": 0,
+    "true_pairs_retrieved_by_tfidf": 0,
+    "index_build_seconds": 23.63
+  },
+  {
+    "retriever": "name_only_plus_char_tfidf",
+    "queries": 40,
+    "truth_pairs": 106,
+    "blocking_recall": 0.9622641509433962,
+    "recall_at_200": 0.9622641509433962,
+    "mean_candidates": 166.05,
+    "p95_candidates": 270.25,
+    "tfidf_fallback_queries": 0,
+    "true_pairs_retrieved_by_tfidf": 0,
+    "index_build_seconds": 37.62,
+    "unique_true_pairs_rescued_by_tfidf": 0,
+    "recall_delta": 0.0
+  }
+]

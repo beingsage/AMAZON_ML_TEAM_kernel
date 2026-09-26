@@ -60,3 +60,15 @@ AMAZON_ML/
 ```
 
 This README is the launch point. The planning docs in `docs/` explain the exact work flow and success criteria.
+
+
+<!-- RUNS_METRICS_START -->
+
+![runs metrics](runs/metrics.png)
+
+
+| run_id | timestamp | candidate_recall | candidate_mean | total_seconds |
+|---|---:|---:|---:|---:|
+| 20260926T092300Z-65afb09d | 2026-09-26T09:23:54.400085+00:00 | 0.0000 | 1.2 | 0.1 |
+
+<!-- RUNS_METRICS_END -->

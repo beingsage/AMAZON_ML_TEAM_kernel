@@ -1,0 +1,40 @@
+[
+  {
+    "retriever": "symbolic_soundex",
+    "queries": 60,
+    "truth_pairs": 175,
+    "blocking_candidate_recall": 1.0,
+    "recall_at_k": {
+      "50": 1.0,
+      "100": 1.0,
+      "200": 1.0,
+      "500": 1.0,
+      "1000": 1.0
+    },
+    "mean_candidates": 306.46666666666664,
+    "p95_candidates": 445.29999999999995,
+    "fallback_queries": 0,
+    "true_pairs_in_tfidf_channel": 0,
+    "index_build_seconds": 24.02
+  },
+  {
+    "retriever": "symbolic_soundex_char_tfidf",
+    "queries": 60,
+    "truth_pairs": 175,
+    "blocking_candidate_recall": 1.0,
+    "recall_at_k": {
+      "50": 1.0,
+      "100": 1.0,
+      "200": 1.0,
+      "500": 1.0,
+      "1000": 1.0
+    },
+    "mean_candidates": 306.46666666666664,
+    "p95_candidates": 445.29999999999995,
+    "fallback_queries": 0,
+    "true_pairs_in_tfidf_channel": 0,
+    "index_build_seconds": 26.46,
+    "true_pairs_uniquely_rescued_by_tfidf": 0,
+    "candidate_recall_delta_vs_symbolic": 0.0
+  }
+]

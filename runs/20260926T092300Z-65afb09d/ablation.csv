@@ -1,0 +1,2 @@
+name_ngram_limit,channel_limit_multiplier,retrieval_context_mode,entity_count,candidate_mean,candidate_p50,candidate_p95,candidate_p99,candidate_max,candidate_recall,index_build_seconds,query_seconds,total_seconds,recall_at_50,recall_at_100,recall_at_200,recall_at_500,recall_at_1000
+single,1.0,once,20.0,1.2,1.0,4.0,4.0,4.0,0.0,0.025044736001291312,0.02732089500022994,0.05236563100152125,0.0,0.0,0.0,0.0,0.0
