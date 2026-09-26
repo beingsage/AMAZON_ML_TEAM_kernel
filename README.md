@@ -1,5 +1,36 @@
 # Amazon ML Challenge 2026 — Project Workspace
 
+## Kaggle one-command run
+
+After cloning this repository in a Kaggle notebook with Internet enabled, run:
+
+```bash
+python kaggle_runner.py
+```
+
+The runner checks out the Git LFS dataset when needed, installs the pinned Python
+requirements, discovers the train/test folders, runs the pipeline, validates both
+TSVs, and creates `AMAZON_ML_TEAM_submission.zip`. The two leaderboard files are
+written to `output/`; the ZIP contains the exact challenge package layout. In
+Kaggle, a copy of the ZIP is also placed directly in `/kaggle/working/` for download.
+
+The default run scores every test Source-1 entity against the full test Source-2/3
+corpus. To keep model selection and final pair fitting within a typical Kaggle
+session, it uses up to 5,000 stratified training entities for OOF selection and up
+to 25,000 for the final pair model, limits per-channel candidates to 10% of the
+pipeline defaults, and disables the memory-intensive optional cross-source target
+graph. These defaults are configurable with `ER_SAMPLE_TRAIN_ROWS`,
+`ER_FINAL_TRAIN_ROWS`, and `ER_DISABLE_TARGET_GRAPH`; set either row count to `0` to
+use every labeled Source-1 training row. `ER_DATASET_DIR` can point to another
+directory containing `train/` and `test/`. `ER_CHANNEL_LIMIT_MULTIPLIER` changes
+the candidate cap; raising it can improve blocking recall at higher runtime and
+output size.
+
+Git LFS stores the provided 1.09 GB challenge archive. The runner extracts its seven
+challenge TSVs automatically (about 2.4 GB unpacked), so Git does not store a second
+copy of the extracted data. Public GitHub LFS downloads count against the repository
+owner's monthly bandwidth allowance.
+
 This workspace contains the challenge PDF and the provided dataset. The goal is to build a business entity resolution pipeline that matches records from Source 2 and Source 3 back to Source 1, using the training data and a validation split to tune the model before generating final test-set outputs.
 
 ## Repository layout

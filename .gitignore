@@ -10,4 +10,5 @@ output/
 student_resource/dataset/
 student_resource/*.zip
 *.zip
+!6ab10eb3b23ba_student_resource.zip
 __MACOSX/

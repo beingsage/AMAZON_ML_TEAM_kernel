@@ -17,6 +17,7 @@ import unicodedata
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Sequence, Set, Tuple
 
@@ -239,6 +240,28 @@ class BlockIndex(defaultdict):
         self.semantic_min_similarity = 0.12
 
 
+@dataclass(frozen=True)
+class RecordFeatureProfile:
+    """Reusable, immutable normalization results for one source record."""
+
+    name_raw: str
+    name_variants: Tuple[Tuple[str, ...], ...]
+    name_tokens: Tuple[str, ...]
+    name_core: str
+    address_raw: str
+    address_tokens: Tuple[str, ...]
+    country: str
+    city_tokens: Tuple[str, ...]
+    state_tokens: frozenset[str]
+    number_tokens: frozenset[str]
+    unit_numbers: frozenset[str]
+    phone_fragments: frozenset[str]
+    postal_codes: frozenset[str]
+    layout_signature: str
+    house_number: str
+    landmark_tokens: frozenset[str]
+
+
 @dataclass
 class NeuralReranker:
     """Classical candidate ranker followed by a small MLP over pair features."""
@@ -422,6 +445,7 @@ CANDIDATE_EFFICIENCY_K = (50, 100, 200, 500, 1000)
 PHONETIC_FALLBACK_MIN_SYMBOLIC_CANDIDATES = 5
 
 
+@lru_cache(maxsize=250_000)
 def normalize_text(value: object) -> str:
     """Fold accents and (when available) transliterate non-Latin text for matching."""
     if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -443,9 +467,13 @@ def normalize_country(value: object) -> str:
     return COUNTRY_ALIASES.get(country, country)
 
 
+@lru_cache(maxsize=250_000)
+def _normalized_token_tuple(text: str) -> Tuple[str, ...]:
+    return tuple(text.split()) if text else ()
+
+
 def token_list(value: object) -> List[str]:
-    text = normalize_text(value)
-    return text.split() if text else []
+    return list(_normalized_token_tuple(normalize_text(value)))
 
 
 def strip_legal_suffix(tokens: Sequence[str]) -> List[str]:
@@ -737,6 +765,62 @@ def address_landmark_tokens(value: object) -> Set[str]:
     return landmarks
 
 
+@lru_cache(maxsize=50_000)
+def _cached_record_feature_profile(
+    name: str,
+    address: str,
+    country: str,
+    strip_legal_suffixes: bool,
+    split_dba_aliases: bool,
+    normalize_address_abbreviations: bool,
+) -> RecordFeatureProfile:
+    """Parse row-level features once, then reuse them across candidate pairs."""
+    # The normalization settings are part of the cache key so normalization
+    # ablations cannot accidentally reuse profiles from another configuration.
+    if (
+        NORMALIZATION_SETTINGS.strip_legal_suffixes != strip_legal_suffixes
+        or NORMALIZATION_SETTINGS.split_dba_aliases != split_dba_aliases
+        or NORMALIZATION_SETTINGS.normalize_address_abbreviations != normalize_address_abbreviations
+    ):
+        raise RuntimeError("Normalization settings changed while building a cached record profile.")
+    variants = tuple(tuple(variant) for variant in name_variants(name))
+    name_tokens = tuple(variants[0]) if variants else ()
+    country_key = normalize_country(country)
+    return RecordFeatureProfile(
+        name_raw=normalize_text(name),
+        name_variants=variants,
+        name_tokens=name_tokens,
+        name_core=" ".join(name_tokens),
+        address_raw=normalize_text(address),
+        address_tokens=tuple(address_tokens(address)),
+        country=country_key,
+        city_tokens=tuple(address_city_tokens(address, country_key)),
+        state_tokens=frozenset(address_state_tokens(address, country_key)),
+        number_tokens=frozenset(address_numbers(address)),
+        unit_numbers=frozenset(unit_numbers(address)),
+        phone_fragments=frozenset(phone_fragments(address)),
+        postal_codes=frozenset(postal_codes(address)),
+        layout_signature=address_layout_signature(address, country_key),
+        house_number=house_number(address),
+        landmark_tokens=frozenset(address_landmark_tokens(address)),
+    )
+
+
+def record_feature_profile(row: Mapping[str, object] | pd.Series) -> RecordFeatureProfile:
+    name = _row_value(row, "business_name")
+    address = _row_value(row, "business_address")
+    country = _row_value(row, "country")
+    name_key = "" if name is None or (isinstance(name, float) and np.isnan(name)) else str(name)
+    address_key = "" if address is None or (isinstance(address, float) and np.isnan(address)) else str(address)
+    country_key = "" if country is None or (isinstance(country, float) and np.isnan(country)) else str(country)
+    return _cached_record_feature_profile(
+        name_key, address_key, country_key,
+        NORMALIZATION_SETTINGS.strip_legal_suffixes,
+        NORMALIZATION_SETTINGS.split_dba_aliases,
+        NORMALIZATION_SETTINGS.normalize_address_abbreviations,
+    )
+
+
 def phone_fragments(value: object) -> Set[str]:
     raw = str(value or "")
     fragments = set()
@@ -869,38 +953,24 @@ def build_pair_features(s1_row: Mapping[str, object] | pd.Series,
                         cand_row: Mapping[str, object] | pd.Series,
                         block_index: BlockIndex | None = None,
                         candidate_rank: int | None = None) -> Dict[str, float]:
-    name1_raw = normalize_text(_row_value(s1_row, "business_name"))
-    name2_raw = normalize_text(_row_value(cand_row, "business_name"))
-    name1_variants = name_variants(_row_value(s1_row, "business_name"))
-    name2_variants = name_variants(_row_value(cand_row, "business_name"))
-    name1 = core_name_tokens(_row_value(s1_row, "business_name"))
-    name2 = core_name_tokens(_row_value(cand_row, "business_name"))
-    name1_core, name2_core = " ".join(name1), " ".join(name2)
-
-    address1_raw = normalize_text(_row_value(s1_row, "business_address"))
-    address2_raw = normalize_text(_row_value(cand_row, "business_address"))
-    address1 = address_tokens(_row_value(s1_row, "business_address"))
-    address2 = address_tokens(_row_value(cand_row, "business_address"))
-    country1 = normalize_country(_row_value(s1_row, "country"))
-    country2 = normalize_country(_row_value(cand_row, "country"))
-    city1 = address_city_tokens(_row_value(s1_row, "business_address"), country1)
-    city2 = address_city_tokens(_row_value(cand_row, "business_address"), country2)
-    state1 = address_state_tokens(_row_value(s1_row, "business_address"), country1)
-    state2 = address_state_tokens(_row_value(cand_row, "business_address"), country2)
-    nums1 = address_numbers(_row_value(s1_row, "business_address"))
-    nums2 = address_numbers(_row_value(cand_row, "business_address"))
-    units1 = unit_numbers(_row_value(s1_row, "business_address"))
-    units2 = unit_numbers(_row_value(cand_row, "business_address"))
-    phones1 = phone_fragments(_row_value(s1_row, "business_address"))
-    phones2 = phone_fragments(_row_value(cand_row, "business_address"))
-    postal1 = postal_codes(_row_value(s1_row, "business_address"))
-    postal2 = postal_codes(_row_value(cand_row, "business_address"))
-    layout1 = address_layout_signature(_row_value(s1_row, "business_address"), country1)
-    layout2 = address_layout_signature(_row_value(cand_row, "business_address"), country2)
-    house1 = house_number(_row_value(s1_row, "business_address"))
-    house2 = house_number(_row_value(cand_row, "business_address"))
-    landmarks1 = address_landmark_tokens(_row_value(s1_row, "business_address"))
-    landmarks2 = address_landmark_tokens(_row_value(cand_row, "business_address"))
+    profile1 = record_feature_profile(s1_row)
+    profile2 = record_feature_profile(cand_row)
+    name1_raw, name2_raw = profile1.name_raw, profile2.name_raw
+    name1_variants, name2_variants = profile1.name_variants, profile2.name_variants
+    name1, name2 = profile1.name_tokens, profile2.name_tokens
+    name1_core, name2_core = profile1.name_core, profile2.name_core
+    address1_raw, address2_raw = profile1.address_raw, profile2.address_raw
+    address1, address2 = profile1.address_tokens, profile2.address_tokens
+    country1, country2 = profile1.country, profile2.country
+    city1, city2 = profile1.city_tokens, profile2.city_tokens
+    state1, state2 = profile1.state_tokens, profile2.state_tokens
+    nums1, nums2 = profile1.number_tokens, profile2.number_tokens
+    units1, units2 = profile1.unit_numbers, profile2.unit_numbers
+    phones1, phones2 = profile1.phone_fragments, profile2.phone_fragments
+    postal1, postal2 = profile1.postal_codes, profile2.postal_codes
+    layout1, layout2 = profile1.layout_signature, profile2.layout_signature
+    house1, house2 = profile1.house_number, profile2.house_number
+    landmarks1, landmarks2 = profile1.landmark_tokens, profile2.landmark_tokens
 
     name_token_j = set_jaccard(name1, name2)
     address_token_j = set_jaccard(address1, address2)
@@ -4519,6 +4589,8 @@ def main() -> None:
     parser.add_argument("--output-dir", default="student_resource/output")
     parser.add_argument("--sample-train-rows", type=int, default=0,
                         help="Stratified Source-1 sample for OOF model selection; 0 uses all training entities.")
+    parser.add_argument("--final-train-rows", type=int, default=0,
+                        help="Stratified Source-1 sample for the final pair model; 0 uses all training entities.")
     parser.add_argument("--cv-folds", type=int, default=5,
                         help="Number of entity-level OOF folds; fold index 0 is reserved for independent evaluation.")
     parser.add_argument("--negatives-per-positive", type=int, default=20)
@@ -4547,6 +4619,8 @@ def main() -> None:
                         help="Scale each retrieval channel's candidate cap by this factor.")
     parser.add_argument("--retrieval-context-mode", choices=("once", "per_channel"), default="once",
                         help="Add retrieval context once per candidate or once per channel.")
+    parser.add_argument("--disable-target-graph", action="store_true",
+                        help="Skip the memory-intensive cross-source target graph; pair graph features are zero.")
     parser.add_argument("--semantic-retrieval", action="store_true",
                         help="Enable a gated character-TF-IDF candidate fallback for sparse symbolic retrieval.")
     parser.add_argument("--semantic-index-max-targets", type=int, default=100000,
@@ -4586,6 +4660,8 @@ def main() -> None:
 
     if args.cv_folds < 3:
         parser.error("--cv-folds must be at least 3.")
+    if args.sample_train_rows < 0 or args.final_train_rows < 0:
+        parser.error("--sample-train-rows and --final-train-rows cannot be negative.")
     if args.neural_top_k < 1:
         parser.error("--neural-top-k must be at least 1.")
     if args.country_stress_rows < 0:
@@ -4657,11 +4733,16 @@ def main() -> None:
         name_ngram_limit=args.name_ngram_limit,
         channel_limit_multiplier=args.candidate_channel_limit_multiplier,
         retrieval_context_mode=args.retrieval_context_mode,
+        build_graph=not args.disable_target_graph,
         semantic_retrieval=args.semantic_retrieval,
         semantic_max_documents=args.semantic_index_max_targets,
         semantic_top_k=args.semantic_top_k,
         semantic_min_similarity=args.semantic_min_similarity,
     )
+    # The lookup and index own the target data needed downstream. Drop the original
+    # source frames and concatenated frame before building pair features so large
+    # runs do not keep several redundant copies of millions of target rows alive.
+    del train_s2, train_s3
     if args.run_country_stress_test:
         write_country_open_set_stress_report(
             output_dir / "country_open_set_stress.csv", oof_source1,
@@ -4670,6 +4751,8 @@ def main() -> None:
             args.name_ngram_limit, args.candidate_channel_limit_multiplier,
             args.retrieval_context_mode, args.semantic_index_max_targets,
         )
+    del combined_train_sources
+    gc.collect()
     if args.run_experiment_matrix:
         if (args.ensemble or args.model == "ensemble") and LGBMClassifier is None:
             parser.error("--ensemble requires LightGBM; install the pinned requirements.txt.")
@@ -4771,10 +4854,15 @@ def main() -> None:
     )
     print(f"Wrote independent OOF error examples to {error_report_path} and bucket summary to {error_bucket_path}")
 
+    final_source1 = stratified_sample_source1(
+        train_s1, truth, args.final_train_rows, full_name_frequencies, args.seed + 1
+    )
+    final_source1_ids = set(final_source1["entity_id"].astype(str))
+    oof_source1_ids = set(oof_source1["entity_id"].astype(str))
     final_training_examples = sampled_training_examples
-    if len(oof_source1) != len(train_s1):
+    if final_source1_ids != oof_source1_ids:
         final_training_examples, _, final_diagnostics = build_training_examples(
-            train_s1, None, truth,
+            final_source1, None, truth,
             negatives_per_positive=args.negatives_per_positive,
             random_negatives=args.random_negatives,
             training=True,
@@ -4785,17 +4873,22 @@ def main() -> None:
         del final_diagnostics
     mined_negatives = selected_oof.mined_negatives
     if not mined_negatives.empty:
+        mined_negatives = mined_negatives[
+            mined_negatives["entity_id"].astype(str).isin(final_source1_ids)
+        ]
+    if not mined_negatives.empty:
         final_training_examples = pd.concat(
             [final_training_examples, mined_negatives[["entity_id", "candidate_id", "label", "features"]]],
             ignore_index=True,
         ).drop_duplicates(["entity_id", "candidate_id"], keep="first")
-    print(f"Final pair-model training pairs (all labeled S1 entities): {len(final_training_examples)}")
+    print(f"Final pair-model training pairs ({len(final_source1):,} labeled S1 entities): "
+          f"{len(final_training_examples):,}")
     model = fit_final_pair_model(
         final_training_examples, selected_oof.model_type, args.seed, args.neural_top_k
     )
     for mining_round in range(2):
         round_negatives = mine_final_adversarial_negatives(
-            train_s1, truth, train_lookup, train_index, model,
+            final_source1, truth, train_lookup, train_index, model,
             final_training_examples, args.adversarial_negatives_per_entity,
             seed=args.seed + mining_round,
         )
@@ -4827,13 +4920,14 @@ def main() -> None:
     )
     print(f"Wrote OOF versus final-model score distribution report to {calibration_report}; "
           "final-model scores are in-sample diagnostics.")
-    print(f"Final model retrained on all {len(train_s1)} labeled Source-1 entities.")
+    print(f"Final model trained on {len(final_source1):,} of {len(train_s1):,} labeled "
+          "Source-1 entities.")
     margin_label = "disabled" if score_margin is None else f"{score_margin:.4f}"
     print(f"OOF-calibrated threshold={threshold:.6f}; within-entity score margin={margin_label}")
 
     del oof_results, selected_oof, sampled_training_examples, final_training_examples
     del train_candidate_diagnostics, train_index, train_lookup
-    del train_s1, train_s2, train_s3, oof_source1, truth
+    del train_s1, final_source1, oof_source1, truth, final_source1_ids, oof_source1_ids
     gc.collect()
     test_s1 = load_source(str(test_dir / "test_source1.tsv"))
     test_s2 = load_source(str(test_dir / "test_source2.tsv"))
@@ -4848,6 +4942,7 @@ def main() -> None:
         name_ngram_limit=args.name_ngram_limit,
         channel_limit_multiplier=args.candidate_channel_limit_multiplier,
         retrieval_context_mode=args.retrieval_context_mode,
+        build_graph=not args.disable_target_graph,
         semantic_retrieval=args.semantic_retrieval,
         semantic_max_documents=args.semantic_index_max_targets,
         semantic_top_k=args.semantic_top_k,
