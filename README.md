@@ -15,8 +15,8 @@ written to `output/`; the ZIP contains the exact challenge package layout. In
 Kaggle, a copy of the ZIP is also placed directly in `/kaggle/working/` for download.
 
 The default run scores every test Source-1 entity against the full test Source-2/3
-corpus. To keep model selection and final pair fitting within a typical Kaggle
-session, it uses up to 5,000 stratified training entities for OOF selection and up
+corpus. To limit model-selection and final pair-training work, it uses up to 5,000
+stratified training entities for OOF selection and up
 to 25,000 for the final pair model, limits per-channel candidates to 10% of the
 pipeline defaults, and disables the memory-intensive optional cross-source target
 graph. These defaults are configurable with `ER_SAMPLE_TRAIN_ROWS`,
@@ -24,7 +24,9 @@ graph. These defaults are configurable with `ER_SAMPLE_TRAIN_ROWS`,
 use every labeled Source-1 training row. `ER_DATASET_DIR` can point to another
 directory containing `train/` and `test/`. `ER_CHANNEL_LIMIT_MULTIPLIER` changes
 the candidate cap; raising it can improve blocking recall at higher runtime and
-output size.
+output size. Full-corpus runtime has not been measured; the settings bound training
+work but do not guarantee the entire inference job will finish within a Kaggle
+session limit.
 
 Git LFS stores the provided 1.09 GB challenge archive. The runner extracts its seven
 challenge TSVs automatically (about 2.4 GB unpacked), so Git does not store a second
