@@ -1,0 +1,15 @@
+{
+  "team_name": "MINI_SMOKE",
+  "train_dir": "/media/sagesujal/DEV1/bytes/AMAZON_ML/runs/real_mini_20260926/data/train",
+  "test_dir": "/media/sagesujal/DEV1/bytes/AMAZON_ML/runs/real_mini_20260926/data/test",
+  "output_dir": "/media/sagesujal/DEV1/bytes/AMAZON_ML/runs/real_mini_20260926/runner_output",
+  "train_source1_rows": 200,
+  "test_source1_rows": 60,
+  "oof_source1_rows": 180,
+  "final_train_rows": 180,
+  "cv_folds": 3,
+  "model": "logistic",
+  "cross_source_target_graph": false,
+  "all_test_source1_rows_scored": true,
+  "seed": 42
+}

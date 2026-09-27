@@ -5,6 +5,7 @@ This folder contains the business entity resolution pipeline for the Amazon ML C
 ## Pipeline
 
 - Normalizes names and addresses, including legal suffixes, DBA aliases, abbreviations, accents, and transliterated text.
+- Treats numeric house-number bases such as `701` and `701A` as compatible, records conflicting letter suffixes separately, and recognizes unit numbers only after explicit unit markers.
 - Builds country-aware exact-name, name-token, name-pair, character n-gram, gated Soundex, address, postal, house-number, and city blocks. Soundex runs only when symbolic retrieval finds fewer than five candidates. Each block channel has its own frequency ceiling, IDF weight, and candidate limit; the channels are then unioned and ranked with name and address context added once per candidate.
 - Optionally adds a character-TF-IDF nearest-name fallback when symbolic and Soundex retrieval return fewer than five candidates. It handles orthographic variation and is not a language-model embedding. The sparse target index is opt-in and capped to control memory.
 - Learns country-specific postal-format and component-order address signatures from the indexed Source-2/3 records, without external address data.
@@ -42,6 +43,65 @@ The default uses all labeled Source-1 rows, five stratified entity folds, LightG
 
 Set `--seed` to reproduce sampling and model initialization (default `42`). Full-data runs keep the target index and generated training examples in memory; the ten-model experiment matrix and retrieval ablations add substantial runtime and memory use. `--sample-train-rows N` caps the OOF model-selection queries, and `--final-train-rows N` independently caps the labeled Source-1 queries used to build final pair-training examples. Both default to all labeled rows in the pipeline. These limits do not sample the target index or test inference: all records in the provided target files remain eligible, and every test Source-1 row is scored. No fixed RAM or runtime figure is claimed here; record those from the target machine and full challenge run.
 
+Block indexes are cached separately for the training and test target files under `OUTPUT_DIR/block_index_cache` by default. The cache key includes the target file paths, sizes, modification times, and all index-building settings. Use `--block-index-cache-dir PATH` to place caches on persistent storage, and `--rebuild-block-index` to force a rebuild. Keep the cache directory between runs to avoid rebuilding the multi-million-row index.
+
+To measure blocking on a larger query sample against the complete training target files without computing pair features or running OOF, use `--retrieval-only`:
+
+```bash
+python code/business_entity_resolution/src/entity_resolution_pipeline.py \
+  --train-dir /kaggle/input/.../train \
+  --test-dir /kaggle/input/.../test \
+  --output-dir /kaggle/working/output \
+  --sample-train-rows 20000 \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --max-test-candidates 25 \
+  --retrieval-only
+```
+
+This reports raw blocking recall, retained top-K recall, candidate-count percentiles, and query throughput in `candidate_retrieval_diagnostics.csv`. It also builds and caches the training target index for later calibration.
+
+For a two-stage Kaggle run, first calibrate on a small sample and stop before final training or test inference:
+
+```bash
+python code/business_entity_resolution/src/entity_resolution_pipeline.py \
+  --train-dir /kaggle/input/.../train \
+  --test-dir /kaggle/input/.../test \
+  --output-dir /kaggle/working/output \
+  --sample-train-rows 8000 \
+  --cv-folds 3 \
+  --model lightgbm \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --negatives-per-positive 6 \
+  --adversarial-negatives-per-entity 2 \
+  --calibration-only \
+  --seed 42
+```
+
+This writes `calibration.pkl` with the selected matcher, threshold, score margin, probability calibrator, and entity decision layer. It also saves the training block-index cache. Preserve both artifacts between Kaggle sessions. Then train once on a moderate labeled sample and run chunked inference without OOF:
+
+```bash
+python code/business_entity_resolution/src/entity_resolution_pipeline.py \
+  --train-dir /kaggle/input/.../train \
+  --test-dir /kaggle/input/.../test \
+  --output-dir /kaggle/working/output \
+  --calibration-artifact /kaggle/working/output/calibration.pkl \
+  --skip-oof \
+  --final-train-rows 40000 \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --max-test-candidates 25 \
+  --test-batch-size 50000 \
+  --negatives-per-positive 6 \
+  --seed 42
+```
+
+The inference pass reads Source-1 test rows in chunks and writes both TSVs incrementally. The default `--max-test-candidates 25` caps each entity's ranked candidate list before pair scoring during calibration, final training, and inference; set it to `0` to keep all retrieved candidates. Calibration and final-run blocking, candidate-cap, graph, and semantic-retrieval settings must match; the pipeline checks these when it loads the calibration artifact.
+
 Use `--sample-train-rows N` to reduce OOF selection work and `--final-train-rows N` to limit final pair-training rows independently; `0` means all rows. Set `--cv-folds` to change the fold count; at least three linked and three singleton entities are needed per fold. Set `--model logistic`, `--model lightgbm`, `--model compare`, or `--model ensemble`. LightGBM must be installed for the default, `compare`, and `ensemble` modes.
 
 Candidate blocking omits keys above a per-channel ceiling derived from `--max-block-frequency` (10,000 by default), and then keeps a bounded top list from each retrieval channel. Set the ceiling to `0` to retain all postings. Check candidate recall and candidate-count diagnostics before changing the ceiling because blocking sets the maximum recoverable match recall.
@@ -61,7 +121,7 @@ Add `--normalization-audit` to write a reproducible sample to `normalization_aud
 ## Output artifacts
 
 - `matching_results.tsv` — selected S2/S3 matches for each test S1 entity.
-- `candidate_pairs.tsv` — candidates passed to the final pair decision stage. With the MLP reranker enabled, this contains only the base model's top-K candidates that the reranker scores.
+- `candidate_pairs.tsv` — candidates passed to the final pair decision stage. The test inference cap defaults to 25 before pair scoring; with the MLP reranker enabled, the reranker can narrow this further.
 - `oof_validation_errors.tsv` — false positives, false negatives, and candidate-retrieval misses from the reserved fold.
 - `oof_error_buckets.csv` — per-bucket counts, precision, recall, bucket entity F0.5, and overall F0.5 change if those errors were fixed.
 - `oof_model_comparison.csv` — pair matcher ranking by non-holdout OOF entity F0.5, with mean, min/max/std fold spread, fold-0 diagnostics, and runtime. It separates `blocking_candidate_recall`, `base_model_topk_recall`, and thresholded `match_recall` (`reranker_match_recall` on fold 0).
@@ -70,12 +130,15 @@ Add `--normalization-audit` to write a reproducible sample to `normalization_aud
 - `retrieval_ablation.csv` — written when retrieval profile comparisons are enabled.
 - `country_open_set_stress.csv` — written when country-masking stress tests are enabled.
 - `calibration_drift.csv` — fold-0 held-out pooled-calibrator summaries, cross-fitted non-holdout threshold-score summaries, and final-model raw/calibrated score distributions. Final training scores are in-sample diagnostics, not a replacement for held-out calibration.
+- `calibration.pkl` — selected model family, OOF threshold/margin, pair-probability calibrator, and entity decision layer for a later `--skip-oof` run.
+- `block_index_cache/` — versioned train/test target indexes reused when input file metadata and index settings match.
+- `candidate_retrieval_diagnostics.csv` — full-target raw and retained candidate recall plus retrieval throughput when `--retrieval-only` is enabled.
 
 The focused invariant tests are in `tests/test_v6_invariants.py`, `tests/test_v7_invariants.py`, `tests/test_v8_invariants.py`, and `tests/test_review_hardening.py`; they cover threshold search, cardinality behavior, calibration isolation, fold-local mining, phonetic and character-TF-IDF retrieval, country stress reporting, direct graph/miner behavior, fold spread, and mixed-negative sampling. `tests/test_pipeline_integration.py` covers inference branches, blocking and normalization cases, TSV validation, validator discovery, and a small train-to-output CLI run. The challenge validator checks are skipped if its development-only script is absent from the package.
 
 Error buckets are feature-based diagnostics and can overlap; `f0_5_impact_if_fixed` estimates the overall reserved-fold change if each bucket's false positives and false negatives were corrected.
 
-The required output TSVs are written under `--output-dir` and `output/` at the project root. For a regular pair matcher, the candidate list contains all retrieved candidates scored by that model. With the MLP reranker, it contains only the top-K candidates that reach the final scoring stage.
+The required output TSVs are written under `--output-dir` and `output/` at the project root. The candidate list contains at most `--max-test-candidates` ranked retrieval results per entity (25 by default). With the MLP reranker, it contains only the candidates that reach the final scoring stage.
 
 ## Limits
 

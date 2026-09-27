@@ -7,7 +7,10 @@ import argparse
 import csv
 import gc
 import hashlib
+import json
 import math
+import os
+import pickle
 import re
 import subprocess
 import sys
@@ -197,7 +200,8 @@ FEATURE_NAMES = [
     "address_char_similarity", "address_char_ngram_jaccard", "address_char_ngram_cosine",
     "address_tfidf_cosine", "address_length_ratio",
     "common_address_tokens", "address_rare_token_overlap", "address_landmark_overlap",
-    "number_token_jaccard", "house_number_match", "house_number_conflict",
+    "number_token_jaccard", "house_number_match", "house_number_base_match",
+    "house_number_suffix_conflict", "house_number_conflict",
     "unit_number_match", "unit_number_conflict", "postal_code_match", "postal_code_conflict",
     "city_token_jaccard", "city_exact", "state_match", "state_conflict",
     "tail_component_similarity", "same_country", "country_conflict", "name_address_consistency",
@@ -220,8 +224,8 @@ FEATURE_NAMES = [
 class BlockIndex(defaultdict):
     """Posting lists plus target-corpus document frequencies for TF-IDF features."""
 
-    def __init__(self) -> None:
-        super().__init__(set)
+    def __init__(self, default_factory=set) -> None:
+        super().__init__(default_factory)
         self.document_count = 0
         self.name_document_frequency: Counter[str] = Counter()
         self.address_document_frequency: Counter[str] = Counter()
@@ -381,6 +385,138 @@ class EntityDecisionLayer:
     cardinality_margins: Dict[int, float | None] = field(default_factory=dict)
     cardinality_confidence_thresholds: Dict[int, float] = field(default_factory=dict)
     feature_pair_threshold: float = 0.0
+
+
+BLOCK_INDEX_CACHE_VERSION = 2
+CALIBRATION_ARTIFACT_VERSION = 2
+
+
+def block_index_settings(max_block_frequency: int,
+                         name_ngram_limit: int,
+                         channel_limit_multiplier: float,
+                         retrieval_context_mode: str,
+                         build_graph: bool,
+                         semantic_retrieval: bool,
+                         semantic_max_documents: int,
+                         semantic_top_k: int,
+                         semantic_min_similarity: float) -> Dict[str, object]:
+    return {
+        "max_block_frequency": int(max_block_frequency),
+        "name_ngram_limit": int(name_ngram_limit),
+        "channel_limit_multiplier": float(channel_limit_multiplier),
+        "retrieval_context_mode": str(retrieval_context_mode),
+        "build_graph": bool(build_graph),
+        "semantic_retrieval": bool(semantic_retrieval),
+        "semantic_max_documents": int(semantic_max_documents),
+        "semantic_top_k": int(semantic_top_k),
+        "semantic_min_similarity": float(semantic_min_similarity),
+    }
+
+
+def load_or_build_block_index(source_df: pd.DataFrame,
+                              cache_dir: Path,
+                              cache_name: str,
+                              source_paths: Sequence[Path],
+                              build_kwargs: Mapping[str, object],
+                              rebuild: bool = False) -> BlockIndex:
+    """Load a compatible target index or build and atomically cache it."""
+    source_signature = []
+    for source_path in source_paths:
+        resolved = source_path.resolve()
+        stat = resolved.stat()
+        source_signature.append({
+            "path": str(resolved),
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        })
+    identity = {
+        "cache_version": BLOCK_INDEX_CACHE_VERSION,
+        "sources": source_signature,
+        "settings": dict(build_kwargs),
+    }
+    identity_text = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    cache_key = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:20]
+    cache_path = cache_dir / f"{cache_name}_{cache_key}.pkl"
+    if cache_path.is_file() and not rebuild:
+        try:
+            with cache_path.open("rb") as handle:
+                cached = pickle.load(handle)
+            if (isinstance(cached, dict)
+                    and cached.get("cache_version") == BLOCK_INDEX_CACHE_VERSION
+                    and cached.get("identity") == identity
+                    and isinstance(cached.get("index"), BlockIndex)):
+                print(f"Loaded {cache_name} block index cache: {cache_path}")
+                return cached["index"]
+            print(f"Ignoring incompatible {cache_name} block index cache: {cache_path}")
+        except Exception as exc:
+            print(f"Could not load {cache_name} block index cache ({exc}); rebuilding it.")
+
+    print(f"Building {cache_name} block index...")
+    index = build_block_index(source_df, **build_kwargs)
+    temporary_path = cache_path.with_name(f".{cache_path.name}.{os.getpid()}.tmp")
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with temporary_path.open("wb") as handle:
+            pickle.dump({
+                "cache_version": BLOCK_INDEX_CACHE_VERSION,
+                "identity": identity,
+                "index": index,
+            }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_path, cache_path)
+        print(f"Saved {cache_name} block index cache: {cache_path}")
+    except (OSError, pickle.PickleError, TypeError) as exc:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"Could not save {cache_name} block index cache ({exc}); continuing without it.")
+    return index
+
+
+def save_calibration_artifact(path: Path,
+                              model_type: str,
+                              threshold: float,
+                              score_margin: float | None,
+                              entity_decision: EntityDecisionLayer | None,
+                              probability_calibrator: Any | None,
+                              retrieval_settings: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temporary_path.open("wb") as handle:
+            pickle.dump({
+                "artifact_version": CALIBRATION_ARTIFACT_VERSION,
+                "model_type": model_type,
+                "threshold": float(threshold),
+                "score_margin": score_margin,
+                "entity_decision": entity_decision,
+                "probability_calibrator": probability_calibrator,
+                "retrieval_settings": dict(retrieval_settings),
+            }, handle, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(temporary_path, path)
+    except Exception:
+        try:
+            temporary_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def load_calibration_artifact(path: Path,
+                              retrieval_settings: Mapping[str, object]) -> Dict[str, object]:
+    with path.open("rb") as handle:
+        artifact = pickle.load(handle)
+    if not isinstance(artifact, dict) or artifact.get("artifact_version") != CALIBRATION_ARTIFACT_VERSION:
+        raise ValueError(f"Unsupported calibration artifact format: {path}")
+    if artifact.get("retrieval_settings") != dict(retrieval_settings):
+        raise ValueError(
+            "Calibration retrieval settings do not match this run. Use the same blocking, graph, "
+            "and semantic-retrieval options as the calibration run."
+        )
+    required = ("model_type", "threshold", "score_margin", "entity_decision", "probability_calibrator")
+    if any(key not in artifact for key in required):
+        raise ValueError(f"Calibration artifact is missing required values: {path}")
+    return artifact
 
 
 @dataclass(frozen=True)
@@ -743,11 +879,37 @@ def house_number(value: object) -> str:
     return numbers[0] if numbers else ""
 
 
+@lru_cache(maxsize=250_000)
+def _cached_house_number_parts(normalized: str) -> Tuple[str, str]:
+    match = re.fullmatch(r"(\d+)([a-z]?)", normalized)
+    return (match.group(1), match.group(2)) if match else ("", "")
+
+
+def house_number_parts(value: object) -> Tuple[str, str]:
+    """Split a parsed house number into its numeric base and optional suffix."""
+    return _cached_house_number_parts(normalize_text(value))
+
+
+def same_house_number_base(left: object, right: object) -> bool:
+    left_base, _ = house_number_parts(left)
+    right_base, _ = house_number_parts(right)
+    return bool(left_base and right_base and left_base == right_base)
+
+
 def unit_numbers(value: object) -> Set[str]:
     tokens = address_tokens(value)
-    markers = {"unit", "apartment", "suite", "floor", "number"}
-    return {tokens[i + 1] for i, token in enumerate(tokens[:-1])
-            if token in markers and re.fullmatch(r"\d+[a-z]?", tokens[i + 1])}
+    markers = {"unit", "apartment", "suite", "floor", "flat", "room"}
+    units: Set[str] = set()
+    for position, token in enumerate(tokens):
+        if token not in markers:
+            continue
+        value_position = position + 1
+        if value_position < len(tokens) and tokens[value_position] in {"number", "no"}:
+            value_position += 1
+        if (value_position < len(tokens)
+                and re.fullmatch(r"\d+[a-z]?", tokens[value_position])):
+            units.add(tokens[value_position])
+    return units
 
 
 def address_landmark_tokens(value: object) -> Set[str]:
@@ -970,6 +1132,11 @@ def build_pair_features(s1_row: Mapping[str, object] | pd.Series,
     postal1, postal2 = profile1.postal_codes, profile2.postal_codes
     layout1, layout2 = profile1.layout_signature, profile2.layout_signature
     house1, house2 = profile1.house_number, profile2.house_number
+    house_base1, house_suffix1 = house_number_parts(house1)
+    house_base2, house_suffix2 = house_number_parts(house2)
+    house_base_match = bool(house_base1 and house_base1 == house_base2)
+    house_suffix_conflict = bool(house_base_match and house_suffix1 and house_suffix2
+                                 and house_suffix1 != house_suffix2)
     landmarks1, landmarks2 = profile1.landmark_tokens, profile2.landmark_tokens
 
     name_token_j = set_jaccard(name1, name2)
@@ -1028,7 +1195,7 @@ def build_pair_features(s1_row: Mapping[str, object] | pd.Series,
         ),
         "candidate_retrieval_score": (
             9.0 * float(bool(postal1 & postal2))
-            + 6.0 * float(bool(house1 and house1 == house2))
+            + 4.0 * float(house_base_match)
             + 3.0 * address_token_j
             + 2.0 * set_jaccard(city1, city2)
             + name_token_j
@@ -1037,7 +1204,8 @@ def build_pair_features(s1_row: Mapping[str, object] | pd.Series,
         "contradiction_score": (
             5.0 * float(country_known and country1 != country2)
             + 4.0 * float(bool(postal1 and postal2 and not postal1 & postal2))
-            + 4.0 * float(bool(house1 and house2 and house1 != house2))
+            + 2.0 * float(bool(house1 and house2 and not house_base_match))
+            + 1.5 * float(house_suffix_conflict)
             + 2.0 * float(bool(state1 and state2 and set(state1) != set(state2)))
         ),
         "name_prefix_similarity": (
@@ -1062,7 +1230,9 @@ def build_pair_features(s1_row: Mapping[str, object] | pd.Series,
         "address_landmark_overlap": set_jaccard(landmarks1, landmarks2),
         "number_token_jaccard": set_jaccard(nums1, nums2),
         "house_number_match": float(bool(house1 and house2 and house1 == house2)),
-        "house_number_conflict": float(bool(house1 and house2 and house1 != house2)),
+        "house_number_base_match": float(house_base_match),
+        "house_number_suffix_conflict": float(house_suffix_conflict),
+        "house_number_conflict": float(bool(house1 and house2 and not house_base_match)),
         "unit_number_match": float(bool(units1 and units2 and units1 & units2)),
         "unit_number_conflict": float(bool(units1 and units2 and not units1 & units2)),
         "postal_code_match": float(bool(postal1 & postal2)),
@@ -1241,6 +1411,9 @@ def populate_cross_source_graph(df: pd.DataFrame, index: BlockIndex) -> None:
                 number = house_number(address)
                 if number:
                     signatures.add(("house", number))
+                    number_base, _ = house_number_parts(number)
+                    if number_base:
+                        signatures.add(("house_base", number_base))
                 for signature in signatures:
                     signature_groups[signature][source].append(entity_id)
         for source_ids in signature_groups.values():
@@ -1257,10 +1430,11 @@ def populate_cross_source_graph(df: pd.DataFrame, index: BlockIndex) -> None:
         strong_address = bool(
             features["address_exact"] or
             (features["postal_code_match"] and features["address_token_jaccard"] >= 0.5) or
-            (features["house_number_match"] and features["address_token_jaccard"] >= 0.35)
+            (features["house_number_base_match"] and features["address_token_jaccard"] >= 0.35)
         )
         if (not strong_address or features["postal_code_conflict"] or
-                features["house_number_conflict"] or features["country_conflict"]):
+                features["house_number_conflict"] or features["house_number_suffix_conflict"]
+                or features["country_conflict"]):
             continue
         name_similarity = float(features["name_variant_similarity"])
         address_similarity = float(features["address_token_jaccard"])
@@ -1388,6 +1562,14 @@ def candidate_keys_for_record(row: Mapping[str, object] | pd.Series,
 
 def load_source(path: str) -> pd.DataFrame:
     return pd.read_csv(path, sep="\t", dtype=str, keep_default_na=False).fillna("")
+
+
+def iter_source_chunks(path: Path, chunk_size: int) -> Iterator[pd.DataFrame]:
+    if chunk_size < 1:
+        raise ValueError("Source chunk size must be positive.")
+    for chunk in pd.read_csv(
+            path, sep="\t", dtype=str, keep_default_na=False, chunksize=chunk_size):
+        yield chunk.fillna("")
 
 
 def parse_truth(path: str) -> Dict[str, Set[str]]:
@@ -1528,7 +1710,7 @@ def generate_candidate_details(s1_row: Mapping[str, object] | pd.Series,
         candidate_house = house_number(candidate_address)
         retrieval_score = (
             9.0 * float(bool(query_postal & candidate_postal))
-            + 6.0 * float(bool(query_house and query_house == candidate_house))
+            + 4.0 * float(same_house_number_base(query_house, candidate_house))
             + 3.0 * set_jaccard(query_address, candidate_address_tokens)
             + 2.0 * set_jaccard(query_city, candidate_city)
             + 1.0 * set_jaccard(query_name, candidate_name)
@@ -1656,6 +1838,71 @@ def print_candidate_diagnostics(label: str,
         print(f"  block {block_type}: mean={block_mean:.1f}, p50={block_p50:.0f}, "
               f"p95={block_p95:.0f}, p99={block_p99:.0f}, max={block_maximum}, "
           f"truth recall={block_recall:.4f}")
+
+
+def write_candidate_retrieval_diagnostics(source1: pd.DataFrame,
+                                          truth: Mapping[str, Set[str]],
+                                          source_lookup: pd.DataFrame,
+                                          index: BlockIndex,
+                                          max_candidates_per_entity: int,
+                                          output_path: Path) -> pd.DataFrame:
+    """Measure full-target blocking recall without building pair features."""
+    started = time.perf_counter()
+    size_histogram: Counter[int] = Counter()
+    total_truth_pairs = 0
+    raw_hits = 0
+    capped_hits = 0
+    recall_at_k_hits: Counter[int] = Counter()
+    for position, row in enumerate(source1.itertuples(index=False), start=1):
+        values = row._asdict()
+        entity_id = str(values.get("entity_id", ""))
+        candidates = generate_candidates(values, index, source_lookup)
+        true_ids = truth.get(entity_id, set())
+        total_truth_pairs += len(true_ids)
+        raw_hits += len(set(candidates) & true_ids)
+        size_histogram[len(candidates)] += 1
+        for limit in (20, 25, 30):
+            recall_at_k_hits[limit] += len(set(candidates[:limit]) & true_ids)
+        retained = (candidates[:max_candidates_per_entity]
+                    if max_candidates_per_entity > 0 else candidates)
+        capped_hits += len(set(retained) & true_ids)
+        if position % 5000 == 0:
+            elapsed = time.perf_counter() - started
+            print(f"Retrieval-only scan: {position:,}/{len(source1):,} entities "
+                  f"({position / max(elapsed, 1e-9):.1f} entities/s)")
+
+    elapsed = time.perf_counter() - started
+    entity_count = len(source1)
+    raw_recall = raw_hits / total_truth_pairs if total_truth_pairs else 1.0
+    capped_recall = capped_hits / total_truth_pairs if total_truth_pairs else 1.0
+    row: Dict[str, object] = {
+        "source1_entities": entity_count,
+        "total_truth_pairs": total_truth_pairs,
+        "raw_blocking_pair_recall": raw_recall,
+        "retained_pair_recall": capped_recall,
+        "max_candidates_per_entity": max_candidates_per_entity,
+        "mean_raw_candidates": (
+            sum(size * count for size, count in size_histogram.items()) / max(entity_count, 1)
+        ),
+        "p50_raw_candidates": histogram_percentile(size_histogram, 0.50),
+        "p95_raw_candidates": histogram_percentile(size_histogram, 0.95),
+        "p99_raw_candidates": histogram_percentile(size_histogram, 0.99),
+        "max_raw_candidates": max(size_histogram, default=0),
+        "generation_seconds": elapsed,
+        "entities_per_second": entity_count / max(elapsed, 1e-9),
+    }
+    for limit in (20, 25, 30):
+        row[f"retrieval_at_{limit}_pair_recall"] = (
+            recall_at_k_hits[limit] / total_truth_pairs if total_truth_pairs else 1.0
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    report = pd.DataFrame([row])
+    report.to_csv(output_path, index=False)
+    print(f"Full-target retrieval diagnostics: raw recall={raw_recall:.4f}; "
+          f"retained recall={capped_recall:.4f}; mean candidates="
+          f"{row['mean_raw_candidates']:.1f}; p95={row['p95_raw_candidates']:.0f}; "
+          f"elapsed={elapsed:.1f}s. Wrote {output_path}")
+    return report
 
 
 def run_retrieval_ablation(source1: pd.DataFrame,
@@ -1839,10 +2086,11 @@ def build_training_examples(train_source1: pd.DataFrame,
                             random_negatives: int = 5,
                             training: bool = True,
                             mine_hard_negatives: bool = True,
-                            seed: int = 42,
-                            source_lookup: Mapping[str, object] | pd.DataFrame | None = None,
-                            index: Dict[Tuple[str, str], Set[str]] | None = None
-                            ) -> Tuple[pd.DataFrame, float, CandidateDiagnostics]:
+                              seed: int = 42,
+                              source_lookup: Mapping[str, object] | pd.DataFrame | None = None,
+                              index: Dict[Tuple[str, str], Set[str]] | None = None,
+                              max_candidates_per_entity: int = 0,
+                              ) -> Tuple[pd.DataFrame, float, CandidateDiagnostics]:
     if source_lookup is None and source2_source3_df is not None:
         source_lookup = build_source_lookup(source2_source3_df)
     if index is None and source2_source3_df is not None:
@@ -1863,7 +2111,11 @@ def build_training_examples(train_source1: pd.DataFrame,
         s1_values = row._asdict()
         entity_id = str(s1_values.get("entity_id", ""))
         candidates, block_candidates = generate_candidate_details(s1_values, index, source_lookup)
+        raw_candidates = candidates
+        if max_candidates_per_entity > 0:
+            candidates = candidates[:max_candidates_per_entity]
         candidate_set = set(candidates)
+        raw_candidate_set = set(raw_candidates)
         candidate_ranks = {candidate_id: position + 1
                            for position, candidate_id in enumerate(candidates)}
         candidate_metadata: List[Dict[str, float]] = [dict() for _ in candidates]
@@ -1882,18 +2134,18 @@ def build_training_examples(train_source1: pd.DataFrame,
         true_ids = truth.get(entity_id, set())
         diagnostics.entity_count += 1
         diagnostics.total_truth_pairs += len(true_ids)
-        diagnostics.found_truth_pairs += len(candidate_set & true_ids)
-        diagnostics.candidate_size_histogram[len(candidates)] += 1
+        diagnostics.found_truth_pairs += len(raw_candidate_set & true_ids)
+        diagnostics.candidate_size_histogram[len(raw_candidates)] += 1
         for block_type in BLOCK_TYPE_NAMES:
             block_ids = block_candidates.get(block_type, set())
             diagnostics.block_size_histograms[block_type][len(block_ids)] += 1
             diagnostics.block_truth_hits[block_type] += len(block_ids & true_ids)
         for limit in CANDIDATE_EFFICIENCY_K:
-            diagnostics.recall_at_k_hits[limit] += len(set(candidates[:limit]) & true_ids)
-            diagnostics.candidates_at_k[limit] += min(limit, len(candidates))
+            diagnostics.recall_at_k_hits[limit] += len(set(raw_candidates[:limit]) & true_ids)
+            diagnostics.candidates_at_k[limit] += min(limit, len(raw_candidates))
         total_truth_pairs += len(true_ids)
+        found_truth_pairs += len(raw_candidate_set & true_ids)
         positive_ids = candidate_set & true_ids
-        found_truth_pairs += len(positive_ids)
         negative_ids = sorted(candidate_set - true_ids)
 
         if training and len(negative_ids) > 0:
@@ -2158,7 +2410,11 @@ def entity_decision_feature_vector(feature_rows: Sequence[Mapping[str, float]],
     name_scores = np.asarray([float(row.get("name_variant_similarity", 0.0)) for row in feature_rows])
     address_scores = np.asarray([float(row.get("address_token_jaccard", 0.0)) for row in feature_rows])
     postal_scores = np.asarray([float(row.get("postal_code_match", 0.0)) for row in feature_rows])
-    house_scores = np.asarray([float(row.get("house_number_match", 0.0)) for row in feature_rows])
+    house_scores = np.asarray([
+        max(float(row.get("house_number_match", 0.0)),
+            float(row.get("house_number_base_match", 0.0)))
+        for row in feature_rows
+    ])
     best_name_position = int(np.argmax(name_scores))
     best_address_position = int(np.argmax(address_scores))
     best_probability = float(probabilities[order[0]])
@@ -3104,6 +3360,7 @@ def run_entity_oof_validation(source1: pd.DataFrame,
                               random_negatives: int,
                               neural_top_k: int = 20,
                               adversarial_negatives_per_entity: int = 5,
+                              max_candidates_per_entity: int = 0,
                               ) -> Tuple[Dict[str, OOFModelResult], pd.DataFrame, float,
                                          CandidateDiagnostics]:
     entity_ids = source1["entity_id"].astype(str).tolist()
@@ -3134,6 +3391,7 @@ def run_entity_oof_validation(source1: pd.DataFrame,
         seed=seed,
         source_lookup=source_lookup,
         index=index,
+        max_candidates_per_entity=max_candidates_per_entity,
     )
     print(f"OOF training examples: {len(all_training_examples)}")
     print_candidate_diagnostics("OOF training pool", train_diagnostics, train_candidate_recall)
@@ -3167,10 +3425,9 @@ def run_entity_oof_validation(source1: pd.DataFrame,
             seed=seed,
             source_lookup=source_lookup,
             index=index,
+            max_candidates_per_entity=max_candidates_per_entity,
         )
-        candidate_recall_by_fold[fold] = candidate_recall_for_rows(
-            validation_examples, truth, validation_ids
-        )
+        candidate_recall_by_fold[fold] = candidate_recall_value
         if fold == 0:
             holdout_examples = validation_examples
             holdout_source1 = validation_source1.copy()
@@ -3200,6 +3457,7 @@ def run_entity_oof_validation(source1: pd.DataFrame,
                     source1.iloc[train_positions], truth, source_lookup, index,
                     mining_model, fold_training_examples,
                     adversarial_negatives_per_entity, seed=seed + fold,
+                    max_candidates_per_entity=max_candidates_per_entity,
                 )
                 if not fold_mined.empty:
                     fit_training_examples = pd.concat(
@@ -3477,7 +3735,8 @@ def mine_final_adversarial_negatives(source1: pd.DataFrame,
                                      model: Any,
                                      existing_examples: pd.DataFrame,
                                      per_entity: int,
-                                     seed: int = 42) -> pd.DataFrame:
+                                     seed: int = 42,
+                                     max_candidates_per_entity: int = 0) -> pd.DataFrame:
     """Mine unsampled false candidates using the current full-data model."""
     columns = ["entity_id", "candidate_id", "label", "features"]
     if per_entity <= 0:
@@ -3492,6 +3751,8 @@ def mine_final_adversarial_negatives(source1: pd.DataFrame,
         candidates, block_candidates = generate_candidate_details(
             s1_values, index, source_lookup, collect_blocks=True
         )
+        if max_candidates_per_entity > 0:
+            candidates = candidates[:max_candidates_per_entity]
         true_ids = truth.get(entity_id, set())
         already_seen = seen_by_entity.get(entity_id, set())
         available = [candidate for candidate in candidates
@@ -3958,6 +4219,7 @@ def predict_test_set(test_source1: pd.DataFrame,
                      index: Dict[Tuple[str, str], Set[str]] | None = None,
                      entity_decision: EntityDecisionLayer | None = None,
                      probability_calibrator: Any | None = None,
+                     max_candidates_per_entity: int = 0,
                      ) -> Iterator[Tuple[str, List[str], List[str]]]:
     if source_lookup is None and source2_source3_df is not None:
         source_lookup = build_source_lookup(source2_source3_df)
@@ -3972,6 +4234,8 @@ def predict_test_set(test_source1: pd.DataFrame,
         candidates, block_candidates = generate_candidate_details(
             s1_values, index, source_lookup, collect_blocks=True
         )
+        if max_candidates_per_entity > 0:
+            candidates = candidates[:max_candidates_per_entity]
         if not candidates:
             yield s1_id, candidates, []
             continue
@@ -4089,6 +4353,78 @@ def write_prediction_outputs(output_dir: Path,
     finally:
         for handle in handles.values():
             handle.close()
+
+
+def run_test_inference(test_dir: Path,
+                       output_dir: Path,
+                       model: Any,
+                       threshold: float,
+                       score_margin: float | None,
+                       entity_decision: EntityDecisionLayer | None,
+                       probability_calibrator: Any | None,
+                       build_kwargs: Mapping[str, object],
+                       cache_dir: Path,
+                       rebuild_index_cache: bool,
+                       test_batch_size: int,
+                       max_test_candidates: int) -> None:
+    test_s2_path = test_dir / "test_source2.tsv"
+    test_s3_path = test_dir / "test_source3.tsv"
+    combined_test_sources = pd.concat(
+        [load_source(str(test_s2_path)), load_source(str(test_s3_path))],
+        ignore_index=True, sort=False,
+    )
+    print(f"Test Source-2 + Source-3 rows: {len(combined_test_sources):,}")
+    test_index = load_or_build_block_index(
+        combined_test_sources, cache_dir, "test", [test_s2_path, test_s3_path],
+        build_kwargs, rebuild=rebuild_index_cache,
+    )
+    test_lookup = build_source_lookup(combined_test_sources)
+    del combined_test_sources
+    gc.collect()
+
+    test_source1_path = test_dir / "test_source1.tsv"
+    print(f"Generating predictions in batches of {test_batch_size:,} Source-1 entities; "
+          f"keeping at most {max_test_candidates or 'all'} candidates per entity.")
+
+    def prediction_rows() -> Iterator[Tuple[str, List[str], List[str]]]:
+        for batch_number, batch in enumerate(
+                iter_source_chunks(test_source1_path, test_batch_size), start=1):
+            print(f"Scoring test Source-1 batch {batch_number:,} ({len(batch):,} entities)...")
+            yield from predict_test_set(
+                batch, None, model, threshold, score_margin,
+                max_block_frequency=int(build_kwargs["max_block_frequency"]),
+                source_lookup=test_lookup, index=test_index,
+                entity_decision=entity_decision,
+                probability_calibrator=probability_calibrator,
+                max_candidates_per_entity=max_test_candidates,
+            )
+
+    root_output = Path("output")
+    write_prediction_outputs(output_dir, root_output, prediction_rows())
+    print(f"Wrote outputs to {output_dir} and {root_output}")
+
+
+def validate_written_submission(args: argparse.Namespace,
+                               test_dir: Path,
+                               output_dir: Path) -> None:
+    if not (args.validate_submission or args.check_submission_ids):
+        return
+    validator = find_submission_validator(test_dir=test_dir)
+    if validator is None:
+        print("Warning: requested submission validation, but the challenge validator was not found; "
+              "prediction files are complete and remain available.")
+        return
+    validation_command = [
+        sys.executable, str(validator),
+        "--matching", str(output_dir / "matching_results.tsv"),
+        "--candidate", str(output_dir / "candidate_pairs.tsv"),
+        "--test-dir", str(test_dir),
+    ]
+    if args.check_submission_ids:
+        validation_command.append("--check-ids")
+    validation_result = subprocess.run(validation_command, check=False)
+    if validation_result.returncode != 0:
+        raise SystemExit(validation_result.returncode)
 
 
 def write_normalization_audit(path: Path,
@@ -4451,6 +4787,7 @@ def write_oof_error_report(path: Path,
         "has_name_both", "has_address_both", "address_layout_country_plausibility",
         "postal_code_match", "house_number_match", "city_token_jaccard", "state_match",
         "same_country", "country_conflict", "postal_code_conflict", "house_number_conflict",
+        "house_number_base_match", "house_number_suffix_conflict",
         "contradiction_score", "phone_fragment_match", "candidate_retrieval_rank_reciprocal",
         "candidate_retrieval_score", "candidate_block_name_exact", "candidate_block_name_pair",
         "candidate_block_name_phonetic",
@@ -4587,12 +4924,24 @@ def main() -> None:
     parser.add_argument("--train-dir", required=True)
     parser.add_argument("--test-dir", required=True)
     parser.add_argument("--output-dir", default="student_resource/output")
+    parser.add_argument("--block-index-cache-dir", default=None,
+                        help="Directory for reusable train/test block indexes; defaults to OUTPUT_DIR/block_index_cache.")
+    parser.add_argument("--rebuild-block-index", action="store_true",
+                        help="Ignore compatible cached indexes, rebuild them, and replace the cache files.")
     parser.add_argument("--sample-train-rows", type=int, default=0,
                         help="Stratified Source-1 sample for OOF model selection; 0 uses all training entities.")
     parser.add_argument("--final-train-rows", type=int, default=0,
                         help="Stratified Source-1 sample for the final pair model; 0 uses all training entities.")
     parser.add_argument("--cv-folds", type=int, default=5,
                         help="Number of entity-level OOF folds; fold index 0 is reserved for independent evaluation.")
+    parser.add_argument("--calibration-only", action="store_true",
+                        help="Run OOF calibration, save the calibration artifact, and stop before final training/inference.")
+    parser.add_argument("--skip-oof", action="store_true",
+                        help="Load a prior calibration artifact, train once on --final-train-rows, and run inference.")
+    parser.add_argument("--calibration-artifact", default=None,
+                        help="Calibration artifact path; defaults to OUTPUT_DIR/calibration.pkl.")
+    parser.add_argument("--retrieval-only", action="store_true",
+                        help="Scan the sampled queries against full targets, report raw/top-K recall, and stop before pair features.")
     parser.add_argument("--negatives-per-positive", type=int, default=20)
     parser.add_argument("--random-negatives", type=int, default=5)
     parser.add_argument("--adversarial-negatives-per-entity", type=int, default=5,
@@ -4613,6 +4962,10 @@ def main() -> None:
                         help="Maximum rows in the normalization audit; use 0 for all Source-1 rows.")
     parser.add_argument("--max-block-frequency", type=int, default=10000,
                         help="Base block frequency ceiling, scaled by block type; use 0 to retain all postings.")
+    parser.add_argument("--max-test-candidates", type=int, default=25,
+                        help="Maximum candidates used per entity in OOF, final training, and test scoring; 0 keeps all.")
+    parser.add_argument("--test-batch-size", type=int, default=50000,
+                        help="Number of test Source-1 rows read and scored at a time.")
     parser.add_argument("--name-ngram-limit", type=int, default=6,
                         help="Maximum sampled name character n-grams; use 0 to keep all n-grams.")
     parser.add_argument("--candidate-channel-limit-multiplier", type=float, default=1.0,
@@ -4652,11 +5005,29 @@ def main() -> None:
 
     if args.skip_submission_validation and (args.validate_submission or args.check_submission_ids):
         parser.error("--skip-submission-validation cannot be combined with validator options.")
+    if args.calibration_only and args.skip_oof:
+        parser.error("--calibration-only and --skip-oof cannot be used together.")
+    if args.retrieval_only and (args.calibration_only or args.skip_oof
+                                or args.run_ablations or args.run_experiment_matrix
+                                or args.run_retrieval_ablation or args.run_country_stress_test
+                                or args.compare_class_weight or args.compare_source_specific
+                                or args.neural_reranker or args.ensemble
+                                or args.model in {"compare", "ensemble"}):
+        parser.error("--retrieval-only cannot be combined with training, OOF, or ablation options.")
+    if args.skip_oof and (args.run_ablations or args.run_experiment_matrix
+                          or args.run_retrieval_ablation or args.run_country_stress_test
+                          or args.compare_class_weight or args.compare_source_specific
+                          or args.neural_reranker or args.ensemble or args.model in {"compare", "ensemble"}):
+        parser.error("--skip-oof cannot be combined with OOF comparison, ablation, or stress-test options.")
 
     train_dir = Path(args.train_dir)
     test_dir = Path(args.test_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = (Path(args.block_index_cache_dir) if args.block_index_cache_dir
+                 else output_dir / "block_index_cache")
+    calibration_path = (Path(args.calibration_artifact) if args.calibration_artifact
+                        else output_dir / "calibration.pkl")
 
     if args.cv_folds < 3:
         parser.error("--cv-folds must be at least 3.")
@@ -4668,6 +5039,10 @@ def main() -> None:
         parser.error("--country-stress-rows cannot be negative.")
     if args.adversarial_negatives_per_entity < 0:
         parser.error("--adversarial-negatives-per-entity cannot be negative.")
+    if args.max_test_candidates < 0:
+        parser.error("--max-test-candidates cannot be negative.")
+    if args.test_batch_size < 1:
+        parser.error("--test-batch-size must be positive.")
     if args.name_ngram_limit < 0:
         parser.error("--name-ngram-limit cannot be negative.")
     if args.candidate_channel_limit_multiplier <= 0:
@@ -4676,10 +5051,32 @@ def main() -> None:
         parser.error("Semantic index document and top-K limits must be positive.")
     if not 0.0 <= args.semantic_min_similarity <= 1.0:
         parser.error("--semantic-min-similarity must be between 0 and 1.")
-    if args.semantic_index_max_targets < 1 or args.semantic_top_k < 1:
-        parser.error("Semantic index document and top-K limits must be positive.")
-    if not 0.0 <= args.semantic_min_similarity <= 1.0:
-        parser.error("--semantic-min-similarity must be between 0 and 1.")
+
+    build_kwargs: Dict[str, object] = {
+        "max_block_frequency": args.max_block_frequency,
+        "name_ngram_limit": args.name_ngram_limit,
+        "channel_limit_multiplier": args.candidate_channel_limit_multiplier,
+        "retrieval_context_mode": args.retrieval_context_mode,
+        "build_graph": not args.disable_target_graph,
+        "semantic_retrieval": args.semantic_retrieval,
+        "semantic_max_documents": args.semantic_index_max_targets,
+        "semantic_top_k": args.semantic_top_k,
+        "semantic_min_similarity": args.semantic_min_similarity,
+    }
+    retrieval_settings = block_index_settings(**build_kwargs)
+    calibration_settings = {
+        **retrieval_settings,
+        "max_candidates_per_entity": args.max_test_candidates,
+    }
+    calibration_artifact = None
+    if args.skip_oof:
+        if not calibration_path.is_file():
+            parser.error(f"Calibration artifact not found: {calibration_path}")
+        try:
+            calibration_artifact = load_calibration_artifact(calibration_path, calibration_settings)
+        except Exception as exc:
+            parser.error(f"Could not load calibration artifact: {exc}")
+        print(f"Loaded OOF calibration from {calibration_path}")
 
     train_s1 = load_source(str(train_dir / "train_source1.tsv"))
     train_s2 = load_source(str(train_dir / "train_source2.tsv"))
@@ -4710,13 +5107,23 @@ def main() -> None:
         name = " ".join(core_name_tokens(value))
         if name:
             full_name_frequencies[name] += 1
-    oof_source1 = stratified_sample_source1(
-        train_s1, truth, args.sample_train_rows, full_name_frequencies, args.seed
-    )
-    print(f"OOF Source-1 entities: {len(oof_source1)} of {len(train_s1)}")
+    oof_source1 = None
+    if not args.skip_oof:
+        oof_source1 = stratified_sample_source1(
+            train_s1, truth, args.sample_train_rows, full_name_frequencies, args.seed
+        )
+        sample_label = "retrieval diagnostic" if args.retrieval_only else "OOF"
+        print(f"{sample_label} Source-1 entities: {len(oof_source1)} of {len(train_s1)}")
 
-    print("Building training-source lookup and adaptive block index...")
+    print("Preparing training-source adaptive block index...")
+    train_s2_path = train_dir / "train_source2.tsv"
+    train_s3_path = train_dir / "train_source3.tsv"
     combined_train_sources = pd.concat([train_s2, train_s3], ignore_index=True, sort=False)
+    del train_s2, train_s3
+    train_index = load_or_build_block_index(
+        combined_train_sources, cache_dir, "train", [train_s2_path, train_s3_path],
+        build_kwargs, rebuild=args.rebuild_block_index,
+    )
     train_lookup = build_source_lookup(combined_train_sources)
     if args.run_retrieval_ablation:
         retrieval_report = output_dir / "retrieval_ablation.csv"
@@ -4727,22 +5134,6 @@ def main() -> None:
             retrieval_report,
         )
         print(f"Wrote retrieval profile comparison to {retrieval_report}")
-    train_index = build_block_index(
-        combined_train_sources,
-        max_block_frequency=args.max_block_frequency,
-        name_ngram_limit=args.name_ngram_limit,
-        channel_limit_multiplier=args.candidate_channel_limit_multiplier,
-        retrieval_context_mode=args.retrieval_context_mode,
-        build_graph=not args.disable_target_graph,
-        semantic_retrieval=args.semantic_retrieval,
-        semantic_max_documents=args.semantic_index_max_targets,
-        semantic_top_k=args.semantic_top_k,
-        semantic_min_similarity=args.semantic_min_similarity,
-    )
-    # The lookup and index own the target data needed downstream. Drop the original
-    # source frames and concatenated frame before building pair features so large
-    # runs do not keep several redundant copies of millions of target rows alive.
-    del train_s2, train_s3
     if args.run_country_stress_test:
         write_country_open_set_stress_report(
             output_dir / "country_open_set_stress.csv", oof_source1,
@@ -4753,6 +5144,57 @@ def main() -> None:
         )
     del combined_train_sources
     gc.collect()
+    if args.retrieval_only:
+        assert oof_source1 is not None
+        write_candidate_retrieval_diagnostics(
+            oof_source1, truth, train_lookup, train_index, args.max_test_candidates,
+            output_dir / "candidate_retrieval_diagnostics.csv",
+        )
+        print("Retrieval-only run complete; pair examples, OOF models, and test inference were skipped.")
+        return
+
+    if args.skip_oof:
+        assert calibration_artifact is not None
+        final_source1 = stratified_sample_source1(
+            train_s1, truth, args.final_train_rows, full_name_frequencies, args.seed + 1
+        )
+        final_training_examples, _, final_diagnostics = build_training_examples(
+            final_source1, None, truth,
+            negatives_per_positive=args.negatives_per_positive,
+            random_negatives=args.random_negatives,
+            training=True,
+            seed=args.seed,
+            source_lookup=train_lookup,
+            index=train_index,
+            max_candidates_per_entity=args.max_test_candidates,
+        )
+        del final_diagnostics
+        model_type = str(calibration_artifact["model_type"])
+        threshold = float(calibration_artifact["threshold"])
+        score_margin = calibration_artifact["score_margin"]
+        entity_decision = calibration_artifact["entity_decision"]
+        probability_calibrator = calibration_artifact["probability_calibrator"]
+        print(f"Final pair-model training pairs ({len(final_source1):,} labeled S1 entities): "
+              f"{len(final_training_examples):,}")
+        model = fit_final_pair_model(
+            final_training_examples, model_type, args.seed, args.neural_top_k
+        )
+        margin_label = "disabled" if score_margin is None else f"{float(score_margin):.4f}"
+        print(f"Loaded matcher={model_type}; calibrated threshold={threshold:.6f}; "
+              f"within-entity score margin={margin_label}")
+        print("Skipping OOF, final adversarial-mining rounds, and OOF-only reports.")
+
+        del final_training_examples, train_index, train_lookup, train_s1
+        del final_source1, truth, full_name_frequencies
+        gc.collect()
+        run_test_inference(
+            test_dir, output_dir, model, threshold, score_margin,
+            entity_decision, probability_calibrator, build_kwargs, cache_dir,
+            args.rebuild_block_index, args.test_batch_size, args.max_test_candidates,
+        )
+        validate_written_submission(args, test_dir, output_dir)
+        return
+
     if args.run_experiment_matrix:
         if (args.ensemble or args.model == "ensemble") and LGBMClassifier is None:
             parser.error("--ensemble requires LightGBM; install the pinned requirements.txt.")
@@ -4790,6 +5232,7 @@ def main() -> None:
             oof_source1, truth, train_lookup, train_index, model_types,
             args.cv_folds, args.seed, args.negatives_per_positive, args.random_negatives,
             args.neural_top_k, args.adversarial_negatives_per_entity,
+            args.max_test_candidates,
         )
     )
     selected_oof = calibrate_and_compare_oof_models(oof_results, truth, args.cv_folds)
@@ -4813,6 +5256,15 @@ def main() -> None:
     else:
         print(f"OOF decision layer active: linked gate={entity_decision.classifier is not None}; "
               f"cardinality model={entity_decision.cardinality_classifier is not None}")
+    save_calibration_artifact(
+        calibration_path, selected_oof.model_type, threshold, score_margin,
+        entity_decision, selected_oof.probability_calibrator, calibration_settings,
+    )
+    print(f"Saved OOF calibration artifact to {calibration_path}")
+    margin_label = "disabled" if score_margin is None else f"{score_margin:.6f}"
+    print(f"Calibration policy: threshold={threshold:.6f}; score margin={margin_label}; "
+          f"entity gate={entity_decision is not None and entity_decision.classifier is not None}; "
+          f"cardinality={entity_decision is not None and entity_decision.cardinality_classifier is not None}")
 
     if args.run_ablations:
         calibration_mask = selected_oof.fold_by_entity != 0
@@ -4832,6 +5284,7 @@ def main() -> None:
             seed=args.seed,
             source_lookup=train_lookup,
             index=train_index,
+            max_candidates_per_entity=args.max_test_candidates,
         )
         report_path = output_dir / "ablation_results.csv"
         run_ablation_suite(
@@ -4854,6 +5307,10 @@ def main() -> None:
     )
     print(f"Wrote independent OOF error examples to {error_report_path} and bucket summary to {error_bucket_path}")
 
+    if args.calibration_only:
+        print("Calibration-only run complete; final training and test inference were skipped.")
+        return
+
     final_source1 = stratified_sample_source1(
         train_s1, truth, args.final_train_rows, full_name_frequencies, args.seed + 1
     )
@@ -4869,6 +5326,7 @@ def main() -> None:
             seed=args.seed,
             source_lookup=train_lookup,
             index=train_index,
+            max_candidates_per_entity=args.max_test_candidates,
         )
         del final_diagnostics
     mined_negatives = selected_oof.mined_negatives
@@ -4891,6 +5349,7 @@ def main() -> None:
             final_source1, truth, train_lookup, train_index, model,
             final_training_examples, args.adversarial_negatives_per_entity,
             seed=args.seed + mining_round,
+            max_candidates_per_entity=args.max_test_candidates,
         )
         if round_negatives.empty:
             print(f"Final adversarial mining round {mining_round + 1} found no unseen negatives.")
@@ -4929,54 +5388,12 @@ def main() -> None:
     del train_candidate_diagnostics, train_index, train_lookup
     del train_s1, final_source1, oof_source1, truth, final_source1_ids, oof_source1_ids
     gc.collect()
-    test_s1 = load_source(str(test_dir / "test_source1.tsv"))
-    test_s2 = load_source(str(test_dir / "test_source2.tsv"))
-    test_s3 = load_source(str(test_dir / "test_source3.tsv"))
-    combined_test_sources = pd.concat([test_s2, test_s3], ignore_index=True, sort=False)
-    del test_s2, test_s3
-    print(f"Generating predictions for all {len(test_s1)} test Source-1 entities...")
-    test_lookup = build_source_lookup(combined_test_sources)
-    test_index = build_block_index(
-        combined_test_sources,
-        max_block_frequency=args.max_block_frequency,
-        name_ngram_limit=args.name_ngram_limit,
-        channel_limit_multiplier=args.candidate_channel_limit_multiplier,
-        retrieval_context_mode=args.retrieval_context_mode,
-        build_graph=not args.disable_target_graph,
-        semantic_retrieval=args.semantic_retrieval,
-        semantic_max_documents=args.semantic_index_max_targets,
-        semantic_top_k=args.semantic_top_k,
-        semantic_min_similarity=args.semantic_min_similarity,
+    run_test_inference(
+        test_dir, output_dir, model, threshold, score_margin,
+        entity_decision, probability_calibrator, build_kwargs, cache_dir,
+        args.rebuild_block_index, args.test_batch_size, args.max_test_candidates,
     )
-    del combined_test_sources
-    predictions = predict_test_set(
-        test_s1, None, model, threshold, score_margin,
-        max_block_frequency=args.max_block_frequency,
-        source_lookup=test_lookup,
-        index=test_index,
-        entity_decision=entity_decision,
-        probability_calibrator=probability_calibrator,
-    )
-    root_output = Path("output")
-    write_prediction_outputs(output_dir, root_output, predictions)
-    print(f"Wrote outputs to {output_dir} and {root_output}")
-    if args.validate_submission or args.check_submission_ids:
-        validator = find_submission_validator(test_dir=test_dir)
-        if validator is None:
-            print("Warning: requested submission validation, but the challenge validator was not found; "
-                  "prediction files are complete and remain available.")
-        else:
-            validation_command = [
-                sys.executable, str(validator),
-                "--matching", str(output_dir / "matching_results.tsv"),
-                "--candidate", str(output_dir / "candidate_pairs.tsv"),
-                "--test-dir", str(test_dir),
-            ]
-            if args.check_submission_ids:
-                validation_command.append("--check-ids")
-            validation_result = subprocess.run(validation_command, check=False)
-            if validation_result.returncode != 0:
-                raise SystemExit(validation_result.returncode)
+    validate_written_submission(args, test_dir, output_dir)
 
 
 if __name__ == "__main__":

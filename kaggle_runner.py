@@ -7,12 +7,14 @@ import argparse
 import csv
 import datetime as dt
 import importlib.metadata
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -37,25 +39,82 @@ def info(message: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Install dependencies, run full test inference, validate, and build the submission ZIP."
+        description="Run retrieval diagnostics, calibration, or full Kaggle inference and package the submission."
     )
     parser.add_argument("--data-root", help="Optional directory containing train/ and test/.")
     parser.add_argument("--train-dir", help="Optional explicit directory containing train TSVs.")
     parser.add_argument("--test-dir", help="Optional explicit directory containing test TSVs.")
     parser.add_argument("--output-dir", default=os.environ.get("ER_OUTPUT_DIR", str(ROOT / "output")))
     parser.add_argument("--team-name", default=os.environ.get("ER_TEAM_NAME", "AMAZON_ML_TEAM"))
-    parser.add_argument("--sample-train-rows", type=int,
-                        default=int(os.environ.get("ER_SAMPLE_TRAIN_ROWS", "5000")),
-                        help="OOF model-selection rows; final test inference always covers every test S1 row.")
-    parser.add_argument("--final-train-rows", type=int,
-                        default=int(os.environ.get("ER_FINAL_TRAIN_ROWS", "25000")),
-                        help="Labeled Source-1 rows used for the final pair-model fit; 0 uses all rows.")
+    workflow = parser.add_mutually_exclusive_group()
+    workflow.add_argument("--retrieval-only", action="store_true",
+                          help="Measure full-target blocking recall and stop without training or packaging.")
+    workflow.add_argument("--calibration-only", action="store_true",
+                          help="Run sampled OOF calibration and stop before final training or packaging.")
+    workflow.add_argument("--skip-oof", action="store_true",
+                          help="Load a prior calibration artifact and run final training plus inference.")
+    workflow.add_argument("--full-kaggle-run", action="store_true",
+                          help="Run retrieval diagnostics, calibration, and lean final inference in sequence.")
+    parser.add_argument("--retrieval-sample-rows", type=int,
+                        default=int(os.environ.get("ER_RETRIEVAL_SAMPLE_ROWS", "20000")),
+                        help="Source-1 rows used by --full-kaggle-run retrieval diagnostics.")
+    parser.add_argument("--sample-train-rows", type=int, default=None,
+                        help="OOF/retrieval query rows; defaults to 20k for retrieval and 8k otherwise.")
+    parser.add_argument("--final-train-rows", type=int, default=None,
+                        help="Labeled Source-1 rows for final fit; defaults to 40k; 0 uses all rows.")
     parser.add_argument("--cv-folds", type=int, default=int(os.environ.get("ER_CV_FOLDS", "3")))
     parser.add_argument("--model", choices=("logistic", "lightgbm", "compare", "ensemble"),
                         default=os.environ.get("ER_MODEL", "lightgbm"))
+    parser.add_argument("--negatives-per-positive", type=int,
+                        default=int(os.environ.get("ER_NEGATIVES_PER_POSITIVE", "6")))
+    parser.add_argument("--random-negatives", type=int,
+                        default=int(os.environ.get("ER_RANDOM_NEGATIVES", "2")))
+    parser.add_argument("--adversarial-negatives-per-entity", type=int,
+                        default=int(os.environ.get("ER_HARD_NEGATIVES", "2")))
+    parser.add_argument("--max-block-frequency", type=int,
+                        default=int(os.environ.get("ER_MAX_BLOCK_FREQUENCY", "3000")))
+    parser.add_argument("--candidate-channel-limit-multiplier", type=float,
+                        default=float(os.environ.get("ER_CHANNEL_LIMIT_MULTIPLIER", "0.5")))
+    parser.add_argument("--name-ngram-limit", type=int,
+                        default=int(os.environ.get("ER_NAME_NGRAM_LIMIT", "4")))
+    parser.add_argument("--retrieval-context-mode", choices=("once", "per_channel"),
+                        default=os.environ.get("ER_RETRIEVAL_CONTEXT_MODE", "once"))
+    parser.add_argument("--max-test-candidates", type=int,
+                        default=int(os.environ.get("ER_MAX_TEST_CANDIDATES", "25")))
+    parser.add_argument("--test-batch-size", type=int,
+                        default=int(os.environ.get("ER_TEST_BATCH_SIZE", "50000")))
+    parser.add_argument("--block-index-cache-dir", default=os.environ.get("ER_BLOCK_INDEX_CACHE_DIR"),
+                        help="Persistent cache directory; defaults to OUTPUT_DIR/block_index_cache.")
+    parser.add_argument("--rebuild-block-index", action="store_true",
+                        help="Rebuild indexes even when a compatible cache is present.")
+    parser.add_argument("--calibration-artifact", default=os.environ.get("ER_CALIBRATION_ARTIFACT"),
+                        help="Calibration pickle; defaults to OUTPUT_DIR/calibration.pkl.")
+    graph_options = parser.add_mutually_exclusive_group()
+    graph_options.add_argument("--disable-target-graph", dest="disable_target_graph",
+                                action="store_true", help="Skip the memory-intensive S2↔S3 graph.")
+    graph_options.add_argument("--enable-target-graph", dest="disable_target_graph",
+                                action="store_false", help="Build the optional S2↔S3 graph.")
+    default_disable_graph = os.environ.get("ER_DISABLE_TARGET_GRAPH", "1").strip().lower() not in {
+        "0", "false", "no"
+    }
+    parser.set_defaults(disable_target_graph=default_disable_graph)
+    parser.add_argument("--semantic-retrieval", action="store_true")
+    parser.add_argument("--semantic-index-max-targets", type=int, default=100000)
+    parser.add_argument("--semantic-top-k", type=int, default=50)
+    parser.add_argument("--semantic-min-similarity", type=float, default=0.12)
     parser.add_argument("--no-install-dependencies", action="store_true",
                         help="Skip checking/installing the pinned project requirements.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not any((args.retrieval_only, args.calibration_only, args.skip_oof, args.full_kaggle_run)):
+        args.full_kaggle_run = True
+    if args.sample_train_rows is None:
+        sample_default = os.environ.get("ER_SAMPLE_TRAIN_ROWS")
+        args.sample_train_rows = int(sample_default) if sample_default is not None else (
+            20000 if args.retrieval_only else 8000
+        )
+    if args.final_train_rows is None:
+        args.final_train_rows = int(os.environ.get("ER_FINAL_TRAIN_ROWS", "40000"))
+    return args
 
 
 def is_lfs_pointer(path: Path) -> bool:
@@ -123,12 +182,80 @@ def hydrate_lfs_dataset() -> None:
 
 
 def has_files(directory: Path, names: tuple[str, ...]) -> bool:
-    return directory.is_dir() and all((directory / name).is_file() for name in names)
+    return directory.is_dir() and all(
+        (directory / name).is_file() and not is_lfs_pointer(directory / name)
+        for name in names
+    )
 
 
 def count_tsv_rows(path: Path) -> int:
     with path.open("rb") as handle:
         return max(0, sum(1 for _ in handle) - 1)
+
+
+def validate_full_inference_outputs(test_dir: Path,
+                                    output_dir: Path,
+                                    expected_rows: int,
+                                    max_candidates: int) -> None:
+    """Check complete ordered test coverage and the configured per-row candidate cap."""
+    test_path = test_dir / "test_source1.tsv"
+    matching_path = output_dir / "matching_results.tsv"
+    candidates_path = output_dir / "candidate_pairs.tsv"
+    for path in (test_path, matching_path, candidates_path):
+        if not path.is_file():
+            raise RuntimeError(f"Full inference output is missing: {path}")
+
+    with test_path.open(encoding="utf-8", newline="") as test_handle, \
+            matching_path.open(encoding="utf-8", newline="") as matching_handle, \
+            candidates_path.open(encoding="utf-8", newline="") as candidates_handle:
+        test_rows = csv.DictReader(test_handle, delimiter="\t")
+        matching_rows = csv.DictReader(matching_handle, delimiter="\t")
+        candidate_rows = csv.DictReader(candidates_handle, delimiter="\t")
+        if "entity_id" not in (test_rows.fieldnames or []):
+            raise RuntimeError(f"Missing entity_id column in {test_path}")
+        expected_headers = {
+            str(matching_path): ["source1_entity_id", "matched_entity_ids"],
+            str(candidates_path): ["source1_entity_id", "candidate_entity_ids"],
+        }
+        if matching_rows.fieldnames != expected_headers[str(matching_path)]:
+            raise RuntimeError(f"Unexpected submission header in {matching_path}")
+        if candidate_rows.fieldnames != expected_headers[str(candidates_path)]:
+            raise RuntimeError(f"Unexpected submission header in {candidates_path}")
+
+        count = 0
+        while True:
+            expected = next(test_rows, None)
+            matching = next(matching_rows, None)
+            candidates = next(candidate_rows, None)
+            if expected is None and matching is None and candidates is None:
+                break
+            count += 1
+            if expected is None or matching is None or candidates is None:
+                raise RuntimeError(
+                    "Submission row coverage differs from test Source-1; "
+                    f"the mismatch starts at data row {count}."
+                )
+            entity_id = expected["entity_id"]
+            if (matching["source1_entity_id"] != entity_id
+                    or candidates["source1_entity_id"] != entity_id):
+                raise RuntimeError(
+                    f"Submission row {count} does not match test Source-1 ID {entity_id!r}."
+                )
+            candidate_ids = [value for value in candidates["candidate_entity_ids"].split(",") if value]
+            matched_ids = [value for value in matching["matched_entity_ids"].split(",") if value]
+            if max_candidates > 0 and len(candidate_ids) > max_candidates:
+                raise RuntimeError(
+                    f"Candidate cap exceeded for {entity_id}: {len(candidate_ids)} > {max_candidates}."
+                )
+            if not set(matched_ids).issubset(candidate_ids):
+                raise RuntimeError(f"Matched IDs are not present in candidate list for {entity_id}.")
+
+    if count != expected_rows:
+        raise RuntimeError(
+            f"Submission covers {count:,} Source-1 rows; expected {expected_rows:,}."
+        )
+    info(f"Full-output check passed: {count:,} test entities; candidate cap="
+         f"{max_candidates if max_candidates else 'unlimited'}.")
 
 
 def discover_data(args: argparse.Namespace) -> tuple[Path, Path]:
@@ -295,10 +422,21 @@ def filled_methodology(team: str, output_dir: Path, run_config: dict[str, object
         f"  --adversarial-negatives-per-entity {run_config['hard_negatives']} \\\n"
         f"  --max-block-frequency {run_config['max_block_frequency']} \\\n"
         f"  --candidate-channel-limit-multiplier {run_config['channel_limit_multiplier']} \\\n"
+        f"  --name-ngram-limit {run_config['name_ngram_limit']} \\\n"
+        f"  --retrieval-context-mode {run_config['retrieval_context_mode']} \\\n"
+        f"  --max-test-candidates {run_config['max_test_candidates']} \\\n"
+        f"  --test-batch-size {run_config['test_batch_size']} \\\n"
         "  --seed 42 --validate-submission"
     )
     if not run_config["cross_source_target_graph"]:
         reproduce_command += " \\\n  --disable-target-graph"
+    if run_config["semantic_retrieval"]:
+        reproduce_command += (
+            " \\\n  --semantic-retrieval"
+            f" --semantic-index-max-targets {run_config['semantic_index_max_targets']}"
+            f" --semantic-top-k {run_config['semantic_top_k']}"
+            f" --semantic-min-similarity {run_config['semantic_min_similarity']}"
+        )
     content = re.sub(
         r"python code/business_entity_resolution/src/entity_resolution_pipeline\.py \\\n"
         r"\s+--train-dir .*?--output-dir output",
@@ -344,14 +482,34 @@ def create_submission_zip(team: str, output_dir: Path, run_config: dict[str, obj
 
 def main() -> None:
     args = parse_args()
-    if args.sample_train_rows < 0 or args.final_train_rows < 0 or args.cv_folds < 3:
-        raise SystemExit("Training row counts cannot be negative, and --cv-folds must be at least 3.")
+    if (args.sample_train_rows < 0 or args.retrieval_sample_rows < 0
+            or args.final_train_rows < 0 or args.cv_folds < 3
+            or args.negatives_per_positive < 0 or args.random_negatives < 0
+            or args.adversarial_negatives_per_entity < 0):
+        raise SystemExit("Row counts and negative counts cannot be negative; --cv-folds must be at least 3.")
+    if args.max_block_frequency < 0 or args.max_test_candidates < 0:
+        raise SystemExit("Block frequency and candidate caps cannot be negative.")
+    if args.name_ngram_limit < 0 or args.candidate_channel_limit_multiplier <= 0:
+        raise SystemExit("Name n-gram limit cannot be negative and channel multiplier must be positive.")
+    if args.test_batch_size < 1:
+        raise SystemExit("--test-batch-size must be positive.")
+    if args.semantic_index_max_targets < 1 or args.semantic_top_k < 1:
+        raise SystemExit("Semantic index size and top-K must be positive.")
+    if not 0.0 <= args.semantic_min_similarity <= 1.0:
+        raise SystemExit("--semantic-min-similarity must be between 0 and 1.")
     team = safe_team_name(args.team_name)
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    hydrate_lfs_dataset()
-    train_dir, test_dir = discover_data(args)
+    # Prefer the Kaggle input mount (or explicit paths). Hydrate the repository's
+    # optional local archive only when no usable mounted dataset can be found.
+    try:
+        train_dir, test_dir = discover_data(args)
+    except RuntimeError:
+        if args.train_dir or args.test_dir or args.data_root:
+            raise
+        hydrate_lfs_dataset()
+        train_dir, test_dir = discover_data(args)
     info(f"Training files: {train_dir}")
     info(f"Test files: {test_dir}")
     train_source1_rows = count_tsv_rows(train_dir / "train_source1.tsv")
@@ -362,15 +520,14 @@ def main() -> None:
     for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
         os.environ.setdefault(name, str(thread_count))
 
-    negatives_per_positive = int(os.environ.get("ER_NEGATIVES_PER_POSITIVE", "5"))
-    random_negatives = int(os.environ.get("ER_RANDOM_NEGATIVES", "2"))
-    hard_negatives = int(os.environ.get("ER_HARD_NEGATIVES", "1"))
-    max_block_frequency = int(os.environ.get("ER_MAX_BLOCK_FREQUENCY", "5000"))
-    channel_limit_multiplier = float(os.environ.get("ER_CHANNEL_LIMIT_MULTIPLIER", "0.1"))
-    disable_target_graph = os.environ.get("ER_DISABLE_TARGET_GRAPH", "1").strip().lower() not in {
-        "0", "false", "no"
-    }
+    workflow_name = (
+        "retrieval-only" if args.retrieval_only else
+        "calibration-only" if args.calibration_only else
+        "skip-oof" if args.skip_oof else
+        "full-kaggle-run" if args.full_kaggle_run else "full"
+    )
     run_config: dict[str, object] = {
+        "workflow": workflow_name,
         "team_name": team,
         "train_dir": str(train_dir),
         "test_dir": str(test_dir),
@@ -379,49 +536,154 @@ def main() -> None:
         "test_source1_rows": test_source1_rows,
         "oof_source1_rows": (train_source1_rows if args.sample_train_rows == 0
                               else min(args.sample_train_rows, train_source1_rows)),
+        "retrieval_source1_rows": min(args.retrieval_sample_rows, train_source1_rows),
         "final_train_rows": (train_source1_rows if args.final_train_rows == 0
                              else min(args.final_train_rows, train_source1_rows)),
         "cv_folds": args.cv_folds,
         "model": args.model,
-        "negatives_per_positive": negatives_per_positive,
-        "random_negatives": random_negatives,
-        "hard_negatives": hard_negatives,
-        "max_block_frequency": max_block_frequency,
-        "channel_limit_multiplier": channel_limit_multiplier,
-        "cross_source_target_graph": not disable_target_graph,
-        "all_test_source1_rows_scored": True,
+        "negatives_per_positive": args.negatives_per_positive,
+        "random_negatives": args.random_negatives,
+        "hard_negatives": args.adversarial_negatives_per_entity,
+        "max_block_frequency": args.max_block_frequency,
+        "channel_limit_multiplier": args.candidate_channel_limit_multiplier,
+        "name_ngram_limit": args.name_ngram_limit,
+        "retrieval_context_mode": args.retrieval_context_mode,
+        "max_test_candidates": args.max_test_candidates,
+        "test_batch_size": args.test_batch_size,
+        "cross_source_target_graph": not args.disable_target_graph,
+        "semantic_retrieval": args.semantic_retrieval,
+        "semantic_index_max_targets": args.semantic_index_max_targets,
+        "semantic_top_k": args.semantic_top_k,
+        "semantic_min_similarity": args.semantic_min_similarity,
+        "block_index_cache_dir": args.block_index_cache_dir,
+        "calibration_artifact": args.calibration_artifact,
+        "all_test_source1_rows_scored": workflow_name in {"full", "skip-oof", "full-kaggle-run"},
         "seed": 42,
+        "status": "running",
+        "completed_stages": [],
+        "stage_runtime_seconds": {},
     }
-    command = [
-        sys.executable, "-u", str(PIPELINE),
-        "--train-dir", str(train_dir), "--test-dir", str(test_dir),
-        "--output-dir", str(output_dir),
-        "--sample-train-rows", str(args.sample_train_rows),
-        "--final-train-rows", str(args.final_train_rows),
-        "--cv-folds", str(args.cv_folds),
-        "--model", args.model,
-        "--negatives-per-positive", str(negatives_per_positive),
-        "--random-negatives", str(random_negatives),
-        "--adversarial-negatives-per-entity", str(hard_negatives),
-        "--max-block-frequency", str(max_block_frequency),
-        "--candidate-channel-limit-multiplier", str(channel_limit_multiplier),
-        "--seed", "42", "--validate-submission",
-    ]
-    if disable_target_graph:
-        command.append("--disable-target-graph")
+    def pipeline_command(stage: str, sample_rows: int, rebuild_index: bool) -> list[str]:
+        command = [
+            sys.executable, "-u", str(PIPELINE),
+            "--train-dir", str(train_dir), "--test-dir", str(test_dir),
+            "--output-dir", str(output_dir),
+            "--sample-train-rows", str(sample_rows),
+            "--final-train-rows", str(args.final_train_rows),
+            "--cv-folds", str(args.cv_folds),
+            "--model", args.model,
+            "--negatives-per-positive", str(args.negatives_per_positive),
+            "--random-negatives", str(args.random_negatives),
+            "--adversarial-negatives-per-entity", str(args.adversarial_negatives_per_entity),
+            "--max-block-frequency", str(args.max_block_frequency),
+            "--candidate-channel-limit-multiplier", str(args.candidate_channel_limit_multiplier),
+            "--name-ngram-limit", str(args.name_ngram_limit),
+            "--retrieval-context-mode", args.retrieval_context_mode,
+            "--max-test-candidates", str(args.max_test_candidates),
+            "--test-batch-size", str(args.test_batch_size),
+            "--seed", "42",
+        ]
+        if args.block_index_cache_dir:
+            command.extend(("--block-index-cache-dir",
+                            str(Path(args.block_index_cache_dir).expanduser().resolve())))
+        if rebuild_index:
+            command.append("--rebuild-block-index")
+        if args.calibration_artifact:
+            command.extend(("--calibration-artifact",
+                            str(Path(args.calibration_artifact).expanduser().resolve())))
+        if stage == "retrieval-only":
+            command.append("--retrieval-only")
+        elif stage == "calibration-only":
+            command.append("--calibration-only")
+        elif stage == "skip-oof":
+            command.extend(("--skip-oof", "--validate-submission"))
+        else:
+            command.append("--validate-submission")
+        if args.disable_target_graph:
+            command.append("--disable-target-graph")
+        if args.semantic_retrieval:
+            command.extend((
+                "--semantic-retrieval",
+                "--semantic-index-max-targets", str(args.semantic_index_max_targets),
+                "--semantic-top-k", str(args.semantic_top_k),
+                "--semantic-min-similarity", str(args.semantic_min_similarity),
+            ))
+        return command
+
+    if args.full_kaggle_run:
+        stages = [
+            ("retrieval-only", args.retrieval_sample_rows),
+            ("calibration-only", args.sample_train_rows),
+            ("skip-oof", args.sample_train_rows),
+        ]
+    elif args.retrieval_only:
+        stages = [("retrieval-only", args.sample_train_rows)]
+    elif args.calibration_only:
+        stages = [("calibration-only", args.sample_train_rows)]
+    elif args.skip_oof:
+        stages = [("skip-oof", args.sample_train_rows)]
+    else:
+        stages = [("full", args.sample_train_rows)]
+
+    summary_path = output_dir / "kaggle_run_summary.json"
+    summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
     info(
-        f"Starting pipeline: OOF sample={run_config['oof_source1_rows']:,}, final training sample="
-        f"{run_config['final_train_rows']:,}, folds={args.cv_folds}; "
-        f"test inference covers all {test_source1_rows:,} test Source-1 rows."
+        f"Starting {workflow_name}: OOF/retrieval sample={run_config['oof_source1_rows']:,}, "
+        f"retrieval sample={run_config['retrieval_source1_rows']:,}, "
+        f"final training sample={run_config['final_train_rows']:,}, folds={args.cv_folds}; "
+        f"test S1 rows={test_source1_rows:,}."
     )
     # The pipeline also writes a convenience `output/` relative to its CWD. Keep
     # that secondary path beside the requested output directory instead of
     # overwriting an unrelated repository-level output during custom runs.
-    subprocess.run(command, cwd=output_dir.parent, check=True)
+    for stage_index, (stage, sample_rows) in enumerate(stages):
+        info(f"Stage {stage_index + 1}/{len(stages)}: {stage}; sample={sample_rows:,}.")
+        stage_started = time.monotonic()
+        try:
+            subprocess.run(
+                pipeline_command(stage, sample_rows,
+                                 rebuild_index=args.rebuild_block_index and stage_index == 0),
+                cwd=output_dir.parent,
+                check=True,
+            )
+        except subprocess.CalledProcessError:
+            run_config["stage_runtime_seconds"][stage] = time.monotonic() - stage_started
+            run_config["status"] = "failed"
+            run_config["failed_stage"] = stage
+            summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
+            raise
+        stage_seconds = time.monotonic() - stage_started
+        run_config["stage_runtime_seconds"][stage] = stage_seconds
+        info(f"Completed {stage} in {stage_seconds / 3600:.2f} hours.")
+        run_config["completed_stages"].append(stage)
+        summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
 
-    archive = create_submission_zip(team, output_dir, run_config)
-    summary_path = output_dir / "kaggle_run_summary.json"
-    import json
+    if args.retrieval_only:
+        run_config["status"] = "completed"
+        summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
+        info(f"Retrieval diagnostics: {output_dir / 'candidate_retrieval_diagnostics.csv'}")
+        info(f"Run summary: {summary_path}")
+        return
+    if args.calibration_only:
+        run_config["status"] = "completed"
+        summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
+        calibration_path = (Path(args.calibration_artifact).expanduser().resolve()
+                            if args.calibration_artifact else output_dir / "calibration.pkl")
+        info(f"Calibration artifact: {calibration_path}")
+        info(f"Run summary: {summary_path}")
+        return
+
+    try:
+        validate_full_inference_outputs(
+            test_dir, output_dir, test_source1_rows, args.max_test_candidates
+        )
+        archive = create_submission_zip(team, output_dir, run_config)
+    except Exception:
+        run_config["status"] = "failed"
+        run_config["failed_stage"] = "output-validation-or-packaging"
+        summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
+        raise
+    run_config["status"] = "completed"
     summary_path.write_text(json.dumps(run_config, indent=2) + "\n", encoding="utf-8")
     info(f"Challenge outputs: {output_dir / 'matching_results.tsv'} and {output_dir / 'candidate_pairs.tsv'}")
     info(f"Final package: {archive}")

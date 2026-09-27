@@ -2,31 +2,71 @@
 
 ## Kaggle one-command run
 
-After cloning this repository in a Kaggle notebook with Internet enabled, run:
+After cloning this repository in a Kaggle notebook, run only:
 
 ```bash
-python kaggle_runner.py
+python run.py
 ```
 
-The runner checks out the Git LFS dataset when needed, installs the pinned Python
-requirements, discovers the train/test folders, runs the pipeline, validates both
-TSVs, and creates `AMAZON_ML_TEAM_submission.zip`. The two leaderboard files are
-written to `output/`; the ZIP contains the exact challenge package layout. In
-Kaggle, a copy of the ZIP is also placed directly in `/kaggle/working/` for download.
+On Kaggle this invokes the three stages below automatically, in one process,
+using the same output directory, cache, and settings. The runner stops if a stage
+fails and records completed stages in `output/kaggle_run_summary.json`.
+The equivalent direct command is `python kaggle_runner.py --full-kaggle-run`.
 
-The default run scores every test Source-1 entity against the full test Source-2/3
-corpus. To limit model-selection and final pair-training work, it uses up to 5,000
-stratified training entities for OOF selection and up
-to 25,000 for the final pair model, limits per-channel candidates to 10% of the
-pipeline defaults, and disables the memory-intensive optional cross-source target
-graph. These defaults are configurable with `ER_SAMPLE_TRAIN_ROWS`,
-`ER_FINAL_TRAIN_ROWS`, and `ER_DISABLE_TARGET_GRAPH`; set either row count to `0` to
-use every labeled Source-1 training row. `ER_DATASET_DIR` can point to another
-directory containing `train/` and `test/`. `ER_CHANNEL_LIMIT_MULTIPLIER` changes
-the candidate cap; raising it can improve blocking recall at higher runtime and
-output size. Full-corpus runtime has not been measured; the settings bound training
-work but do not guarantee the entire inference job will finish within a Kaggle
-session limit.
+The runner can discover the Kaggle input mount automatically, or you can pass
+`--data-root` (or both `--train-dir` and `--test-dir`). A recommended three-step
+run measures blocking against the full target corpus, saves calibration, then
+does final inference without repeating OOF:
+
+```bash
+python kaggle_runner.py \
+  --retrieval-only \
+  --sample-train-rows 20000 \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --max-test-candidates 25
+
+python kaggle_runner.py \
+  --calibration-only \
+  --sample-train-rows 8000 \
+  --cv-folds 3 \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --max-test-candidates 25
+
+python kaggle_runner.py \
+  --skip-oof \
+  --final-train-rows 40000 \
+  --max-block-frequency 3000 \
+  --candidate-channel-limit-multiplier 0.5 \
+  --name-ngram-limit 4 \
+  --max-test-candidates 25 \
+  --test-batch-size 50000
+```
+
+`--retrieval-only` writes `candidate_retrieval_diagnostics.csv` and exits;
+`--calibration-only` saves `calibration.pkl` and exits; `--skip-oof` loads that
+artifact, trains the final pair model once, writes and validates both TSVs, and
+creates `AMAZON_ML_TEAM_submission.zip`. Keep the output directory between these
+steps so the calibration artifact and versioned block-index cache are reused. The
+blocking, graph, semantic retrieval, and candidate-cap settings must match across
+calibration and final inference. The ZIP is also copied to `/kaggle/working/` when
+available.
+
+`python run.py --pipeline ...` forwards workflow options to `kaggle_runner.py`;
+`python run.py --mode full` also starts the three-stage pipeline. For a standalone
+stage, use `kaggle_runner.py --retrieval-only`, `--calibration-only`, or `--skip-oof`.
+`run.py --mode test` and `run.py --mode sweep` remain legacy retrieval-only utilities.
+
+The runner defaults to an 8,000-row OOF sample, 40,000 final training rows,
+3 folds, block frequency 3,000, channel multiplier 0.5, name n-gram limit 4,
+top-25 candidates, 50,000-row test batches, and a disabled target graph. Override
+these with CLI options; common settings can also be supplied through `ER_*` environment variables. It
+checks dependencies, discovers the train/test folders, and writes the outputs and
+run summary beneath `output/` by default. Full-corpus runtime still needs to be
+measured on the target Kaggle session.
 
 Git LFS stores the provided 1.09 GB challenge archive. The runner extracts its seven
 challenge TSVs automatically (about 2.4 GB unpacked), so Git does not store a second

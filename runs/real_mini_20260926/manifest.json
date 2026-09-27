@@ -1,0 +1,21 @@
+{
+  "seed": 9262026,
+  "source": "student_resource/dataset/train (real labeled examples)",
+  "training_entity_count": 200,
+  "training_linked": 180,
+  "training_singletons": 20,
+  "heldout_entity_count": 60,
+  "heldout_linked": 48,
+  "heldout_singletons": 12,
+  "target_record_count": 30107,
+  "target_sample": "Retains every linked target ID for the initial 1,200-query draw before reducing to 200 train and 60 evaluation queries; also includes deterministic background rows sampled from every 100k-row target-file block.",
+  "model": "logistic",
+  "cv_folds": 3,
+  "semantic_char_tfidf_enabled": true,
+  "hard_negative_rounds": 0,
+  "output_dir": "/media/sagesujal/DEV1/bytes/AMAZON_ML/runs/real_mini_20260926/pipeline_output",
+  "metrics_file": "/media/sagesujal/DEV1/bytes/AMAZON_ML/runs/real_mini_20260926/real_mini_end_to_end_metrics.json",
+  "reproducible_mini_data": "runs/real_mini_20260926/data",
+  "heldout_truth": "runs/real_mini_20260926/data/eval_ground_truth.tsv",
+  "validator": "PASS (structural and target-ID existence checks)"
+}

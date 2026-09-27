@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the pipeline, record metrics, and update README with visualizations."""
+"""Kaggle pipeline alias with the older retrieval-ablation utility retained."""
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
@@ -12,23 +13,55 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any
 
-import matplotlib.pyplot as plt
-import pandas as pd
-
-# Import pipeline helpers
-sys.path.insert(0, str(Path(__file__).with_name("code")))
-from business_entity_resolution.src.entity_resolution_pipeline import (
-    load_source,
-    parse_truth,
-    build_source_lookup,
-    build_block_index,
-    run_retrieval_ablation,
-    generate_candidates,
-)
-
 
 RUNS_DIR = Path("runs")
-RUNS_DIR.mkdir(exist_ok=True)
+
+
+PIPELINE_SWITCHES = {
+    "--retrieval-only", "--calibration-only", "--skip-oof", "--train-dir",
+    "--full-kaggle-run", "--test-dir", "--calibration-artifact", "--max-test-candidates",
+    "--test-batch-size", "--block-index-cache-dir", "--rebuild-block-index",
+    "--retrieval-sample-rows",
+    "--data-root", "--output-dir", "--team-name", "--sample-train-rows",
+    "--final-train-rows", "--cv-folds", "--model", "--name-ngram-limit",
+    "--candidate-channel-limit-multiplier", "--retrieval-context-mode",
+    "--disable-target-graph", "--enable-target-graph", "--semantic-retrieval",
+    "--negatives-per-positive", "--random-negatives",
+    "--adversarial-negatives-per-entity",
+    "--no-install-dependencies", "--semantic-index-max-targets",
+    "--semantic-top-k", "--semantic-min-similarity",
+}
+
+
+def load_legacy_dependencies() -> None:
+    """Load plotting and retrieval dependencies only for the old ablation mode."""
+    import pandas as pd
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        plt = None
+
+    sys.path.insert(0, str(Path(__file__).with_name("code")))
+    from business_entity_resolution.src.entity_resolution_pipeline import (
+        load_source,
+        parse_truth,
+        build_source_lookup,
+        build_block_index,
+        run_retrieval_ablation,
+        generate_candidates,
+    )
+
+    globals().update({
+        "plt": plt,
+        "pd": pd,
+        "load_source": load_source,
+        "parse_truth": parse_truth,
+        "build_source_lookup": build_source_lookup,
+        "build_block_index": build_block_index,
+        "run_retrieval_ablation": run_retrieval_ablation,
+        "generate_candidates": generate_candidates,
+    })
 
 
 def make_run_id() -> str:
@@ -80,7 +113,7 @@ def aggregate_runs() -> pd.DataFrame:
 
 
 def plot_trajectory(agg: pd.DataFrame, out: Path) -> None:
-    if agg.empty:
+    if agg.empty or plt is None:
         return
     plt.figure(figsize=(8, 4))
     plt.plot(agg["timestamp"], agg["candidate_recall"], marker="o", label="candidate_recall")
@@ -191,7 +224,33 @@ def update_readme(agg: pd.DataFrame, image_path: Path) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser()
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    kaggle_default = not raw_args and Path("/kaggle/input").is_dir()
+    full_mode = False
+    if "--mode" in raw_args:
+        mode_position = raw_args.index("--mode")
+        full_mode = mode_position + 1 < len(raw_args) and raw_args[mode_position + 1] == "full"
+    if ("--pipeline" in raw_args or kaggle_default or full_mode
+            or any(flag in raw_args for flag in PIPELINE_SWITCHES)):
+        forwarded = [arg for arg in raw_args if arg != "--pipeline"]
+        if full_mode:
+            mode_position = forwarded.index("--mode")
+            del forwarded[mode_position:mode_position + 2]
+        explicit_stage = any(flag in forwarded for flag in (
+            "--retrieval-only", "--calibration-only", "--skip-oof", "--full-kaggle-run"
+        ))
+        if not explicit_stage and (kaggle_default or full_mode or "--pipeline" in raw_args):
+            forwarded.append("--full-kaggle-run")
+        runner = Path(__file__).with_name("kaggle_runner.py")
+        return subprocess.run([sys.executable, str(runner), *forwarded], check=False).returncode
+
+    load_legacy_dependencies()
+    RUNS_DIR.mkdir(exist_ok=True)
+    parser = argparse.ArgumentParser(
+        description="Use --pipeline to forward Kaggle workflow options to kaggle_runner.py."
+    )
+    parser.add_argument("--pipeline", action="store_true",
+                        help="Forward the remaining arguments to kaggle_runner.py.")
     parser.add_argument("--source1", default="student_resource/dataset/train/train_source1.tsv")
     parser.add_argument("--source2_3", default="student_resource/dataset/train/train_source2.tsv")
     parser.add_argument("--truth", default="student_resource/dataset/train/train_ground_truth.tsv")
@@ -199,8 +258,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--ngram-limit", type=int, default=6)
     parser.add_argument("--channel-multiplier", type=float, default=1.0)
     parser.add_argument("--context-mode", choices=["once", "per_channel"], default="once")
-    parser.add_argument("--mode", choices=["test", "full"], default=None,
-                        help="Run mode: 'test' for a quick test run, 'full' for end-to-end sweep.")
+    parser.add_argument("--mode", choices=["test", "sweep"], default=None,
+                        help="'test' runs one small retrieval profile; 'sweep' runs the legacy profile sweep.")
     parser.add_argument("--sample-size", type=int, default=100,
                         help="When in test mode, number of rows to sample from source1 and source2.")
     args = parser.parse_args(argv)
@@ -211,10 +270,10 @@ def main(argv: list[str] | None = None) -> int:
     mode = args.mode
     if mode is None:
         try:
-            choice = input("Choose run mode ('test' to run a quick test, 'full' for full run): ").strip().lower()
+            choice = input("Choose run mode ('test' for a quick sample, 'sweep' for legacy retrieval ablations): ").strip().lower()
         except Exception:
             choice = "test"
-        if choice not in {"test", "full"}:
+        if choice not in {"test", "sweep"}:
             print("Invalid choice, defaulting to 'test'.")
             choice = "test"
         mode = choice
